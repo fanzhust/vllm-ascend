@@ -59,6 +59,17 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 
 
+def test_shutdown_closes_engram_before_parent_cleanup():
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.model = MagicMock()
+
+    with patch.object(GPUModelRunner, "shutdown") as parent:
+        runner.shutdown()
+
+    runner.model.close_engram_offload.assert_called_once_with()
+    parent.assert_called_once_with()
+
+
 class DenseAttentionBackend(AscendAttentionBackend):
     pass
 

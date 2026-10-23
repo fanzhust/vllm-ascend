@@ -92,6 +92,7 @@ from .engram.embedding import (
     preflight_engram_checkpoint,
 )
 from .engram.layer import AscendEngram
+from .engram.memfabric import MemFabricEngramSession
 from .engram.parallel import gather_engram_hashes, resolve_dp_shared_memory
 from .indexer import DeepseekV41Indexer
 
@@ -1023,6 +1024,11 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         self.engram_dp_shared_memory = resolve_dp_shared_memory(
             bool(vllm_config.engram_config and vllm_config.engram_config.dp_shared_memory)
         )
+        self._engram_offload_session = None
+        self._engram_max_tokens = max(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+        )
         self.engram_layout = EngramLayout.from_config(config) if self.has_engram else None
         if self.engram_layout is not None:
             # Complete head buckets per rank, laid out over TP and the
@@ -1036,8 +1042,23 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     self.engram_weight_root, config.engram_layer_ids, AscendParallelEngramEmbedding
                 )
             native_mxfp8 = get_current_hardware_profile().supports(HardwareCapability.ENGRAM_MXFP8)
+            use_memfabric = get_ascend_config().engram_offload_backend == "memfabric"
+            prepared = []
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
             for slot, (layer_id, rows) in enumerate(zip(config.engram_layer_ids, config.engram_num_embeddings)):
                 head_sizes = tuple(size for order in self.engram_layout.primes[slot] for size in order)
+                local_heads = 0
+                part_rows = 0
+                if use_memfabric:
+                    if len(head_sizes) % tp_size:
+                        raise ValueError(
+                            "MemFabric Engram requires uniform TP head shards: "
+                            f"{len(head_sizes)} heads over TP{tp_size}"
+                        )
+                    local_heads = len(head_sizes) // tp_size
+                    head_start = tp_rank * local_heads
+                    part_rows = sum(head_sizes[head_start : head_start + local_heads])
                 storage_dtype = torch.bfloat16 if vllm_config.quant_config is None else torch.int8
                 if vllm_config.load_config.load_format != "dummy":
                     storage_dtype = engram_storage_dtype(self.engram_weight_root, layer_id)
@@ -1045,17 +1066,40 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                         storage_dtype = torch.int8
                 elif native_mxfp8 and vllm_config.quant_config is not None:
                     storage_dtype = torch.float8_e4m3fn
-                embed = AscendParallelEngramEmbedding(
-                    rows,
-                    config.engram_head_dim,
-                    head_sizes,
-                    slot,
-                    storage_dtype=storage_dtype,
-                    cpu_offload=cpu_offload,
-                    dp_shared_memory=self.engram_dp_shared_memory,
+                if use_memfabric and storage_dtype != torch.int8:
+                    raise ValueError(
+                        f"MemFabric Engram requires A3 INT8/FP32 storage; layer {layer_id} resolved to {storage_dtype}"
+                    )
+                prepared.append((slot, layer_id, rows, head_sizes, local_heads, part_rows, storage_dtype))
+
+            if use_memfabric:
+                self._engram_offload_session = MemFabricEngramSession(
+                    [(slot, part_rows, local_heads) for slot, _, _, _, local_heads, part_rows, _ in prepared],
+                    self._engram_max_tokens,
+                    get_ascend_config().engram_memfabric,
                 )
-                embed.bind_checkpoint(self.engram_weight_root, f"layers.{layer_id}.engram.embed.weight")
-                self.layers[layer_id].engram.embed_tokens = embed
+            try:
+                for slot, layer_id, rows, head_sizes, _, _, storage_dtype in prepared:
+                    table = (
+                        self._engram_offload_session.table(slot) if self._engram_offload_session is not None else None
+                    )
+                    embed = AscendParallelEngramEmbedding(
+                        rows,
+                        config.engram_head_dim,
+                        head_sizes,
+                        slot,
+                        storage_dtype=storage_dtype,
+                        cpu_offload=cpu_offload,
+                        dp_shared_memory=self.engram_dp_shared_memory,
+                        memfabric_table=table,
+                    )
+                    embed.bind_checkpoint(self.engram_weight_root, f"layers.{layer_id}.engram.embed.weight")
+                    self.layers[layer_id].engram.embed_tokens = embed
+            except Exception:
+                if self._engram_offload_session is not None:
+                    self._engram_offload_session.close(synchronize_group=False)
+                    self._engram_offload_session = None
+                raise
         self.engram_hash = None
         self._engram_input_buffers = None
         # ExternalEvent pairs for FULL graph capture. V1 keys by the forward
@@ -1066,10 +1110,6 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         self._engram_capture_stream = None
         self._engram_capture_events = None
         self._engram_overlap_enabled = get_ascend_config().multistream_engram_overlap
-        self._engram_max_tokens = max(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            vllm_config.compilation_config.max_cudagraph_capture_size or 0,
-        )
         rotation_path = get_rotation_path(vllm_config)
         self.engram_rotated = rotation_path is not None
         self.register_buffer("engram_rotation", torch.eye(32), persistent=False)
@@ -1321,6 +1361,24 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 for mask_ready, events in self._engram_graph_events.values():
                     for event in (mask_ready, *events.values()):
                         event.reset(main)
+
+    def close_engram_offload(self) -> None:
+        """Deterministically release model-owned Engram host resources."""
+        if not self.has_engram:
+            return
+        session = self._engram_offload_session
+        for layer_id in self.config.engram_layer_ids:
+            layer = self.layers[layer_id]
+            embed = getattr(getattr(layer, "engram", None), "embed_tokens", None)
+            if not isinstance(embed, AscendParallelEngramEmbedding):
+                continue
+            if session is not None:
+                embed.detach_memfabric()
+            else:
+                embed.close_host_offload()
+        if session is not None:
+            session.close()
+            self._engram_offload_session = None
 
     def _get_engram_input_buffers(self):
         """Persistent capacity-sized lookup/mask buffers shared by all runs."""
@@ -1663,6 +1721,9 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
 
     def retire_engram_lookups(self, *, reset_events=False):
         self.model.retire_engram_lookups(reset_events=reset_events)
+
+    def close_engram_offload(self) -> None:
+        self.model.close_engram_offload()
 
     def get_model_state_cls(self):
         """V2 runner states read token_lookback_depth and drive engram inputs."""

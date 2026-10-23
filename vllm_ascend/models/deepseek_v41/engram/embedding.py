@@ -37,6 +37,7 @@ from .npu import (
     SharedUvaBuffer,
     gather_dequantize_engram_int8,
     gather_dequantize_host_uva,
+    gather_dequantize_memfabric,
     quantize_engram_rows,
 )
 from .parallel import (
@@ -61,18 +62,20 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         cpu_offload: bool = False,
         dp_shared_memory: bool = False,
         storage_dtype: torch.dtype = torch.int8,
+        memfabric_table=None,
     ) -> None:
         self.storage_dtype = storage_dtype
         if storage_dtype not in (torch.bfloat16, torch.int8, torch.float8_e4m3fn):
             raise ValueError(f"Unsupported Engram storage dtype: {storage_dtype}")
         self.scale_dtype = torch.uint8 if storage_dtype == torch.float8_e4m3fn else torch.float32
         self.cpu_offload = cpu_offload
+        self._memfabric_table = memfabric_table
         self.layer_hash_index = layer_hash_index
         self._shared_group = None
         if not all(in_the_same_node_as(get_tp_group().cpu_group)):
             raise ValueError("Ascend Engram requires the TP ranks of one replica to stay on a single node")
         group = get_engram_dp_group()
-        if group is not None and not all(in_the_same_node_as(group.cpu_group)):
+        if memfabric_table is None and group is not None and not all(in_the_same_node_as(group.cpu_group)):
             raise ValueError(
                 "Ascend Engram requires all DP replicas to share the same node and shared-memory namespace"
             )
@@ -121,15 +124,17 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
             if self.weight_scale_inv is not None:
                 scale_one = 127 if self.scale_dtype == torch.uint8 else 1.0
                 set_weight_attrs(self.weight_scale_inv, {"dummy_weight_value": scale_one})
+            code_bytes = (
+                memfabric_table.local_codes.numel() * memfabric_table.local_codes.element_size()
+                if memfabric_table is not None
+                else weight.numel() * weight.element_size()
+            )
             logger.info(
-                "Engram table offloaded to registered host memory: %d rows x %d, %.2f GiB per rank",
+                "Engram table offloaded to %s: %d rows x %d, %.2f GiB per rank",
+                "MemFabric DRAM (codes) + HBM (scales)" if memfabric_table is not None else "registered host memory",
                 self.part_num_embeddings,
                 self.dim,
-                (
-                    weight.numel() * weight.element_size()
-                    + (scales.numel() * scales.element_size() if scales is not None else 0)
-                )
-                / 1024**3,
+                (code_bytes + (scales.numel() * scales.element_size() if scales is not None else 0)) / 1024**3,
             )
 
     def _get_shard_info(self) -> tuple[int, int]:
@@ -142,6 +147,25 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         scales_shape = (self.part_num_embeddings, self.dim // self.block_size)
         device = torch.device("npu", torch.npu.current_device())
         quantized = self.storage_dtype != torch.bfloat16
+        if getattr(self, "_memfabric_table", None) is not None:
+            if not self.cpu_offload:
+                raise ValueError("MemFabric Engram storage requires cpu_offload=True")
+            if self.storage_dtype != torch.int8 or self.scale_dtype != torch.float32:
+                raise ValueError("MemFabric Engram storage requires INT8 codes and FP32 scales")
+            if self.dim != 256 or self.block_size != 32:
+                raise ValueError("MemFabric Engram storage currently requires dim=256 and block_size=32")
+            if self._memfabric_table.segment.rows != self.part_num_embeddings:
+                raise ValueError(
+                    "MemFabric Engram table layout mismatch: "
+                    f"planned={self._memfabric_table.segment.rows}, embedding={self.part_num_embeddings}"
+                )
+            # The checkpoint iterator still needs a named parameter carrying
+            # the custom weight_loader callback. Codes themselves live in the
+            # model-owned pool, so this is deliberately a zero-sized sentinel.
+            return (
+                torch.empty(0, dtype=self.storage_dtype, device=device),
+                torch.zeros(scales_shape, dtype=self.scale_dtype, device=device),
+            )
         if not self.cpu_offload:
             return (
                 # Zeroed, not empty: the engine profiles the model (and runs the
@@ -198,6 +222,10 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
                 ),
             )
 
+    def detach_memfabric(self) -> None:
+        """Drop this embedding's non-owning table view before pool teardown."""
+        self._memfabric_table = None
+
     def bind_checkpoint(self, model_path, key: str) -> None:
         """Use parameter callbacks while retaining the indexed shard reader.
 
@@ -218,6 +246,14 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         Shared head slices have one writer per EDP group. The final CPU
         collective synchronizes writes and propagates loading failures.
         """
+        if getattr(self, "_memfabric_table", None) is not None:
+            error = None
+            try:
+                self._load_into_storage(model_path, key, chunk_rows)
+            except Exception as exc:  # noqa: BLE001 - propagated to every pool rank
+                error = f"{type(exc).__name__}: {exc}"
+            self._memfabric_table.pool.load_barrier(error)
+            return
         if self._shared_group is None:
             self._load_into_storage(model_path, key, chunk_rows)
             return
@@ -271,6 +307,13 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         with safe_open(root / index[key], framework="pt", device="cpu") as file:
             tensor = file.get_slice(key)
             source_dtype = tensor.get_dtype()
+            if getattr(self, "_memfabric_table", None) is not None:
+                expected_shape = (self.num_embeddings, self.dim)
+                if tuple(tensor.get_shape()) != expected_shape:
+                    raise ValueError(
+                        f"{key}: MemFabric Engram reload cannot change layout; "
+                        f"expected {expected_shape}, got {tuple(tensor.get_shape())}. Restart the worker."
+                    )
             if self.weight.dtype == torch.bfloat16:
                 if tensor.get_dtype() != "BF16":
                     raise ValueError(f"{key}: expected BF16 source for BF16 storage")
@@ -283,6 +326,7 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
                     raise ValueError(f"{key}: expected MXFP8 source for MXFP8 storage")
                 with safe_open(root / index[scale_key], framework="pt", device="cpu") as sf:
                     scale = sf.get_slice(scale_key)
+                    self._validate_memfabric_scale_shape(scale_key, scale)
                     if scale.get_dtype() != "F8_E8M0":
                         raise ValueError(f"{scale_key}: MXFP8 requires E8M0 scales")
                     for chunk_start in range(start, end, chunk_rows):
@@ -291,18 +335,17 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
                         target_end = offset + stop - chunk_start
                         # Preserve the checkpoint bits; uint8 scales hold the
                         # E8M0 exponent, not a numerically cast integer value.
-                        self.weight.data[offset:target_end].view(torch.uint8).copy_(
-                            tensor[chunk_start:stop].view(torch.uint8)
-                        )
+                        self._copy_codes(offset, tensor[chunk_start:stop].view(torch.uint8))
                         self.weight_scale_inv.data[offset:target_end].copy_(scale[chunk_start:stop].view(torch.uint8))
             elif source_dtype in ("I8", "INT8"):
                 with safe_open(root / index[scale_key], framework="pt", device="cpu") as sf:
                     scale = sf.get_slice(scale_key)
+                    self._validate_memfabric_scale_shape(scale_key, scale)
                     for chunk_start in range(start, end, chunk_rows):
                         stop = min(chunk_start + chunk_rows, end)
                         offset = chunk_start - self.vocab_start_idx
                         target_end = offset + (stop - chunk_start)
-                        self.weight.data[offset:target_end].copy_(tensor[chunk_start:stop])
+                        self._copy_codes(offset, tensor[chunk_start:stop])
                         self.weight_scale_inv.data[offset:target_end].copy_(scale[chunk_start:stop])
             elif source_dtype in ("F8_E4M3", "F8_E4M3FN"):
                 # Older devices use INT8/FP32 storage. Decode the checkpoint's
@@ -310,6 +353,7 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
                 # bit-preserving load path above.
                 with safe_open(root / index[scale_key], framework="pt", device="cpu") as sf:
                     scale = sf.get_slice(scale_key)
+                    self._validate_memfabric_scale_shape(scale_key, scale)
                     for chunk_start in range(start, end, chunk_rows):
                         stop = min(chunk_start + chunk_rows, end)
                         offset = chunk_start - self.vocab_start_idx
@@ -318,7 +362,7 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
                         group_scales = scale[chunk_start:stop].float()
                         values = (values.unflatten(-1, (-1, self.block_size)) * group_scales.unsqueeze(-1)).flatten(-2)
                         codes, scales = quantize_engram_rows(values)
-                        self.weight.data[offset:target_end].copy_(codes)
+                        self._copy_codes(offset, codes)
                         self.weight_scale_inv.data[offset:target_end].copy_(scales)
             else:
                 for chunk_start in range(start, end, chunk_rows):
@@ -326,9 +370,30 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
                     offset = chunk_start - self.vocab_start_idx
                     target_end = offset + (stop - chunk_start)
                     codes, scales = quantize_engram_rows(tensor[chunk_start:stop].to(torch.float32))
-                    self.weight.data[offset:target_end].copy_(codes)
+                    self._copy_codes(offset, codes)
                     self.weight_scale_inv.data[offset:target_end].copy_(scales)
         logger.info("Engram rows [%d, %d) loaded from %s", start, end, index[key])
+
+    def _copy_codes(self, local_row_start: int, codes: torch.Tensor) -> None:
+        if getattr(self, "_memfabric_table", None) is not None:
+            self._memfabric_table.copy_codes(local_row_start, codes.view(torch.int8))
+            return
+        target_end = local_row_start + codes.shape[0]
+        target = self.weight.data[local_row_start:target_end]
+        if target.dtype == torch.float8_e4m3fn and codes.dtype == torch.uint8:
+            target.view(torch.uint8).copy_(codes)
+        else:
+            target.copy_(codes)
+
+    def _validate_memfabric_scale_shape(self, key: str, scale) -> None:
+        if getattr(self, "_memfabric_table", None) is None:
+            return
+        expected_shape = (self.num_embeddings, self.dim // self.block_size)
+        if tuple(scale.get_shape()) != expected_shape:
+            raise ValueError(
+                f"{key}: MemFabric Engram reload cannot change scale layout; "
+                f"expected {expected_shape}, got {tuple(scale.get_shape())}. Restart the worker."
+            )
 
     def embed_gathered(self, gathered: torch.Tensor, num_tokens: int) -> torch.Tensor:
         """Embed ids already gathered across the EDP group.
@@ -391,7 +456,14 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
             vocab_end=self.vocab_end_idx,
             output=out.view(-1, self.dim),
         )
-        if self._codes_uva is not None:
+        if self._memfabric_table is not None:
+            gather_dequantize_memfabric(
+                self._memfabric_table,
+                self.weight_scale_inv,
+                indices,
+                **launch,
+            )
+        elif self._codes_uva is not None:
             codes_uva = cast(HostUvaBuffer, self._codes_uva)
             scales_uva = cast(HostUvaBuffer, self._scales_uva) if self._scales_uva is not None else None
             gather_dequantize_host_uva(codes_uva, scales_uva, indices, **launch)

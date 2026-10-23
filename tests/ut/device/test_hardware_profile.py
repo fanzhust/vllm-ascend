@@ -58,6 +58,7 @@ _EXPECTED_CAPABILITIES = {
     | {
         HardwareCapability.CANN_MEGAMOE,
         HardwareCapability.GMM_DEQUANT_SITU_QUANT,
+        HardwareCapability.ENGRAM_MEMFABRIC,
         HardwareCapability.MC2_FULLMESH_V2_COMM,
         HardwareCapability.RMS_NORM_CAST,
         HardwareCapability.MOE_DISPATCH_EXTRA_ARGS,

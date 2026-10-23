@@ -267,6 +267,34 @@ and use the `main` branch with the matching vLLM revision recorded in
         used by this configuration. `enable_cpu_binding` pins worker processes to
         CPUs, while `enable_npugraph_ex` enables the enhanced ACL Graph path.
 
+#### Experimental MemFabric Engram Offload
+
+On A3, Engram INT8 codes can be placed in a MemFabric SHARED Host DRAM pool
+while the FP32 group scales remain in each NPU's HBM. Install a compatible
+`memfabric_hybrid` wheel and first validate its `shared_engram_offload.py`
+example. Then add the following fields to the existing Engram configuration:
+
+```shell
+--engram-config '{"cpu_offload":true,"dp_shared_memory":true}' \
+--additional-config '{
+  "engram_offload_backend":"memfabric",
+  "engram_memfabric":{
+    "pool_scope":"engram_share_group",
+    "store_url_template":"tcp://127.0.0.1:{port}",
+    "store_port_base":8600,
+    "strict":true
+  }
+}'
+```
+
+Each group of DP replicas at the same TP position joins one pool. The pool for
+TP rank `k` uses `store_port_base + k`; ensure that this port range is free.
+The first implementation requires PCP1, INT8 Engram storage with 256-wide
+rows, and strict error handling. It supports both model runner V1 and V2
+lifecycle cleanup. For a two-node DP2/TP8 trial, keep each complete TP8 replica
+within one node and replace `127.0.0.1` with the pool rank-0 node's reachable
+address. Cross-node TP is not part of this validation topology.
+
 ### 5.2 1P1D PD Disaggregated Deployment
 
 === "A3 series"

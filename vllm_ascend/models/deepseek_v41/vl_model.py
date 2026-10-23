@@ -222,6 +222,9 @@ class AscendDeepseekV41ForCausalLM(
     def retire_engram_lookups(self, *, reset_events=False):
         self.language_model.retire_engram_lookups(reset_events=reset_events)
 
+    def close_engram_offload(self) -> None:
+        self.language_model.close_engram_offload()
+
     def prepare_engram_inputs(
         self,
         input_ids,

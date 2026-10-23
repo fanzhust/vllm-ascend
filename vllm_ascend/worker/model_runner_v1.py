@@ -4367,6 +4367,13 @@ class NPUModelRunner(GPUModelRunner):
             # collect eplb heat for all requests.
             self.eplb_heat_collection_status =  True
 
+    def shutdown(self) -> None:
+        model = getattr(self, "model", None)
+        close_engram = getattr(model, "close_engram_offload", None)
+        if callable(close_engram):
+            close_engram()
+        super().shutdown()
+
     def load_model(self) -> None:
         from vllm_ascend.model_executor.warmup.early_kernel_warmup import (
             join_early_kernel_warmup,

@@ -121,3 +121,66 @@ def _engram_host_uva_gather_dequant_kernel(
             output + (token * PAD_HEADS + head_local) * WIDTH + col,
             tl.where(owned, result, tl.zeros_like(result)),
         )
+
+
+@triton.jit
+def _engram_memfabric_map_ids_kernel(
+    ids,
+    global_ids,
+    count,
+    rows,
+    vocab_start,
+    vocab_end,
+    ids_stride_t,
+    HEAD_START: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    LAYER_BASE: tl.constexpr,
+    ROWS_PER_SLOT: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row < rows:
+        token = row // LOCAL_HEADS
+        head_local = row % LOCAL_HEADS
+        source_row = tl.load(ids + token * ids_stride_t + HEAD_START + head_local).to(tl.int64)
+        owned = (source_row >= vocab_start) & (source_row < vocab_end)
+        local_row = tl.where(owned, source_row - vocab_start, 0)
+        owner = local_row // CAPACITY
+        owner_row = local_row % CAPACITY
+        global_row = owner * ROWS_PER_SLOT + LAYER_BASE + owner_row
+        tl.store(global_ids + row, global_row)
+        if row == 0:
+            tl.store(count, rows)
+
+
+@triton.jit
+def _engram_memfabric_dequant_kernel(
+    staging,
+    scales,
+    ids,
+    output,
+    rows,
+    vocab_start,
+    vocab_end,
+    ids_stride_t,
+    WIDTH: tl.constexpr,
+    GROUP: tl.constexpr,
+    HEAD_START: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    PAD_HEADS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row < rows:
+        token = row // LOCAL_HEADS
+        head_local = row % LOCAL_HEADS
+        source_row = tl.load(ids + token * ids_stride_t + HEAD_START + head_local).to(tl.int64)
+        owned = (source_row >= vocab_start) & (source_row < vocab_end)
+        local_row = tl.where(owned, source_row - vocab_start, 0)
+        col = tl.arange(0, WIDTH)
+        codes = tl.load(staging + row * WIDTH + col).to(tl.float32)
+        scale = tl.load(scales + local_row * (WIDTH // GROUP) + col // GROUP)
+        result = (codes * scale).to(tl.bfloat16)
+        tl.store(
+            output + (token * PAD_HEADS + head_local) * WIDTH + col,
+            tl.where(owned, result, tl.zeros_like(result)),
+        )

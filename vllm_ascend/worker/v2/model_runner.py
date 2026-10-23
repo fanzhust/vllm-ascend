@@ -451,6 +451,13 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.model_state.kvpp_runtime = self.kvpp
 
+    def shutdown(self) -> None:
+        model = getattr(self, "model", None)
+        close_engram = getattr(model, "close_engram_offload", None)
+        if callable(close_engram):
+            close_engram()
+        super().shutdown()
+
     def _register_sparse_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         """Bind host pools before the V2 KV connector registers its destinations."""
         manager = self.sparse_kv_offload_manager

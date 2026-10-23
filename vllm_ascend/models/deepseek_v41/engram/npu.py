@@ -248,6 +248,76 @@ def gather_dequantize_host_uva(
     return output
 
 
+def gather_dequantize_memfabric(
+    table,
+    scales: torch.Tensor,
+    ids: torch.Tensor,
+    *,
+    head_start: int,
+    local_heads: int,
+    pad_heads: int,
+    output: torch.Tensor,
+    vocab_start: int,
+    vocab_end: int,
+) -> torch.Tensor:
+    """Gather 256-byte INT8 rows from MemFabric, then dequantize with HBM scales."""
+    from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+
+    rows = ids.shape[0] * local_heads
+    if rows == 0:
+        return output
+    if rows > table.global_ids.numel():
+        raise ValueError(
+            f"MemFabric Engram lookup needs {rows} rows, but its stable scratch holds {table.global_ids.numel()}"
+        )
+    init_device_properties_triton()
+    from vllm_ascend.ops.triton.engram_lookup import (
+        _engram_memfabric_dequant_kernel,
+        _engram_memfabric_map_ids_kernel,
+    )
+
+    _engram_memfabric_map_ids_kernel[(rows,)](
+        ids,
+        table.global_ids,
+        table.count,
+        rows,
+        vocab_start,
+        vocab_end,
+        ids.stride(0),
+        HEAD_START=head_start,
+        LOCAL_HEADS=local_heads,
+        CAPACITY=table.capacity,
+        LAYER_BASE=table.layer_base,
+        ROWS_PER_SLOT=table.rows_per_slot,
+        num_warps=1,
+    )
+    rc = table.pool.offload.entry_gather(
+        table.staging.data_ptr(),
+        table.global_ids.data_ptr(),
+        table.count.data_ptr(),
+        table.pool.topology.device_id,
+    )
+    if rc:
+        raise RuntimeError(f"MemFabric Engram entry_gather failed: rc={rc}")
+    _engram_memfabric_dequant_kernel[(rows,)](
+        table.staging,
+        scales,
+        ids,
+        output,
+        rows,
+        vocab_start,
+        vocab_end,
+        ids.stride(0),
+        WIDTH=table.staging.shape[1],
+        GROUP=SCALE_GROUP,
+        HEAD_START=head_start,
+        LOCAL_HEADS=local_heads,
+        PAD_HEADS=pad_heads,
+        num_warps=4,
+    )
+    return output
+
+
 class SharedUvaBuffer:
     """One host range mapped and registered by every rank of a local group.
 
