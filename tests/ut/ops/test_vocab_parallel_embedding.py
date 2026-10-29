@@ -180,6 +180,29 @@ class TestCustomVocabParallelEmbedding(unittest.TestCase):
         mock_reduce_tp.assert_called_once()
         self.assertEqual(output.shape, (2, self.embedding_dim))
 
+    def test_forward_stage_hook_splits_local_lookup_and_tp_reduce(self):
+        layer = self._create_layer()
+        layer.tp_size = 2
+        stages = []
+        layer._vllm_ascend_forward_stage_hook = lambda stage, tensor: stages.append((stage, tuple(tensor.shape)))
+
+        input_ = torch.tensor([15, 35])
+        with patch("torch.ops.vllm.all_reduce", side_effect=lambda x, _: x):
+            output = layer.forward(input_)
+
+        self.assertEqual(
+            [stage for stage, _ in stages],
+            [
+                "entry",
+                "after-input-mask",
+                "after-local-lookup",
+                "after-output-mask",
+                "after-tp-all-reduce",
+            ],
+        )
+        self.assertTrue(all(shape[0] == input_.shape[0] for _, shape in stages))
+        self.assertEqual(output.shape, (2, self.embedding_dim))
+
     def test_sequence_parallel_moe_keeps_complete_embedding(self):
         layer = self._create_layer()
         input_ = torch.tensor([15, 35, 16, 36])

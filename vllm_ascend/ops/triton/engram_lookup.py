@@ -121,3 +121,80 @@ def _engram_host_uva_gather_dequant_kernel(
             output + (token * PAD_HEADS + head_local) * WIDTH + col,
             tl.where(owned, result, tl.zeros_like(result)),
         )
+
+
+@triton.jit
+def _engram_memfabric_map_ids_kernel(
+    ids,
+    global_ids,
+    count,
+    rows,
+    vocab_start,
+    vocab_end,
+    ids_stride_t,
+    HEAD_START: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    SLOT_RANK: tl.constexpr,
+    LAYER_BASE: tl.constexpr,
+    ROWS_PER_SLOT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = row < rows
+    token = row // LOCAL_HEADS
+    head_local = row % LOCAL_HEADS
+    source_row = tl.load(
+        ids + token * ids_stride_t + HEAD_START + head_local,
+        mask=mask,
+        other=0,
+    ).to(tl.int64)
+    owned = mask & (source_row >= vocab_start) & (source_row < vocab_end)
+    local_row = tl.where(owned, source_row - vocab_start, 0)
+    # A TP-scoped pool stores this rank's complete local head shard in its own
+    # slot. The lookup never repartitions local rows over the other TP slots;
+    # their different head shards are combined by the existing TP all-gather.
+    global_row = SLOT_RANK * ROWS_PER_SLOT + LAYER_BASE + local_row
+    tl.store(global_ids + row, global_row, mask=mask)
+    if pid == 0:
+        tl.store(count, rows)
+
+
+@triton.jit
+def _engram_memfabric_dequant_kernel(
+    staging,
+    staging_fp32,
+    ids,
+    output,
+    rows,
+    vocab_start,
+    vocab_end,
+    ids_stride_t,
+    ENTRY_BYTES: tl.constexpr,
+    CODE_BYTES: tl.constexpr,
+    GROUP: tl.constexpr,
+    HEAD_START: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    PAD_HEADS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row < rows:
+        token = row // LOCAL_HEADS
+        head_local = row % LOCAL_HEADS
+        source_row = tl.load(ids + token * ids_stride_t + HEAD_START + head_local).to(tl.int64)
+        owned = (source_row >= vocab_start) & (source_row < vocab_end)
+        col = tl.arange(0, CODE_BYTES)
+        entry = staging + row * ENTRY_BYTES
+        codes = tl.load(entry + col).to(tl.float32)
+        # staging_fp32 aliases the packed staging storage. Supplying its typed
+        # base from PyTorch avoids an int8-pointer -> FP32-pointer cast, which
+        # Ascend Triton rejects even though both pointers have the same width.
+        scale_base = staging_fp32 + row * (ENTRY_BYTES // 4) + CODE_BYTES // 4
+        groups = tl.arange(0, CODE_BYTES // GROUP)
+        scale = tl.load(scale_base + groups)
+        value = tl.reshape(codes, (CODE_BYTES // GROUP, GROUP)) * scale[:, None]
+        result = tl.reshape(value, (CODE_BYTES,)).to(tl.bfloat16)
+        tl.store(
+            output + (token * PAD_HEADS + head_local) * CODE_BYTES + col,
+            tl.where(owned, result, tl.zeros_like(result)),
+        )

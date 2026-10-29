@@ -451,6 +451,13 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.model_state.kvpp_runtime = self.kvpp
 
+    def shutdown(self) -> None:
+        model = getattr(self, "model", None)
+        close_engram = getattr(model, "close_engram_offload", None)
+        if callable(close_engram):
+            close_engram()
+        super().shutdown()
+
     def _register_sparse_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         """Bind host pools before the V2 KV connector registers its destinations."""
         manager = self.sparse_kv_offload_manager
@@ -635,6 +642,12 @@ class NPUModelRunner(GPUModelRunner):
                 "scheduled locally — a request sent directly to the decode node)."
             )
 
+    def _engram_memfabric_diagnostic_fence(self, stage: str) -> None:
+        """Let Engram models isolate pending NPU work during full bypass."""
+        fence = getattr(self.model, "engram_memfabric_diagnostic_fence", None)
+        if fence is not None:
+            fence(stage)
+
     def prepare_inputs(  # type: ignore[misc]
         self,
         scheduler_output: SchedulerOutput,
@@ -650,13 +663,17 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
         assert num_tokens > 0
 
+        self._engram_memfabric_diagnostic_fence("runner-input-entry")
+
         req_ids = batch_req_state.req_ids
 
         self._update_seq_lens_cpu(scheduler_output, req_ids)
+        self._engram_memfabric_diagnostic_fence("runner-after-seq-lens-cpu")
 
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
         idx_mapping_np = batch_req_state.idx_mapping_np
         idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+        self._engram_memfabric_diagnostic_fence("runner-after-idx-mapping-h2d")
         num_reqs = len(req_ids)
 
         num_valid_tokens = num_scheduled_tokens_np
@@ -676,6 +693,7 @@ class NPUModelRunner(GPUModelRunner):
             num_valid_tokens,
             kv_cache_config=self.kv_cache_config,
         )
+        self._engram_memfabric_diagnostic_fence("runner-after-attn-state")
 
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -686,8 +704,10 @@ class NPUModelRunner(GPUModelRunner):
             total_num_logits = num_reqs
             cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
             cu_num_logits = torch.arange(num_reqs + 1, device=self.device, dtype=torch.int32)
+            self._engram_memfabric_diagnostic_fence("runner-after-cu-num-logits-arange")
             expanded_idx_mapping = idx_mapping
             expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
+            self._engram_memfabric_diagnostic_fence("runner-after-expanded-local-pos-zero")
         else:
             num_draft_tokens_per_req = np.fromiter(
                 (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
@@ -702,6 +722,7 @@ class NPUModelRunner(GPUModelRunner):
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
             cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+            self._engram_memfabric_diagnostic_fence("runner-after-cu-num-logits-h2d")
 
         adaptive_verification_manager = self.adaptive_verification
         adaptive_verification_active = (
@@ -736,11 +757,13 @@ class NPUModelRunner(GPUModelRunner):
 
         query_start_loc = self.input_buffers.query_start_loc
         async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
+        self._engram_memfabric_diagnostic_fence("runner-after-query-start-h2d")
 
         if adaptive_verification_active:
             cu_num_logits, query_start_loc, total_num_draft_tokens = adaptive_verification_manager.reallocate_drafts(
                 req_ids, idx_mapping
             )
+            self._engram_memfabric_diagnostic_fence("runner-after-reallocate-drafts")
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
 
             # Non-fia backends skip padding query boundary when using adaptive verification
@@ -759,11 +782,13 @@ class NPUModelRunner(GPUModelRunner):
 
             query_start_loc = self.input_buffers.query_start_loc
             async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
+            self._engram_memfabric_diagnostic_fence("runner-after-adaptive-query-start-h2d")
 
         if draft_tokens:
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
                 idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
             )
+            self._engram_memfabric_diagnostic_fence("runner-after-expand-idx-mapping")
 
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = query_start_loc[: num_reqs_padded + 1]
@@ -784,6 +809,8 @@ class NPUModelRunner(GPUModelRunner):
                 self.req_states.num_computed_tokens.gpu,
             )
 
+        self._engram_memfabric_diagnostic_fence("runner-after-prefill-inputs")
+
         # Prepare positions and seq_lens.
         prepare_pos_seq_lens(
             idx_mapping,
@@ -792,6 +819,7 @@ class NPUModelRunner(GPUModelRunner):
             self.input_buffers.positions,
             self.input_buffers.seq_lens,
         )
+        self._engram_memfabric_diagnostic_fence("runner-after-pos-seq-lens")
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
         if adaptive_verification_active and self.use_fia:
             self.input_buffers.seq_lens_np[:num_reqs] = seq_lens[:num_reqs].cpu().numpy()
@@ -817,6 +845,7 @@ class NPUModelRunner(GPUModelRunner):
             total_num_logits,
             self.model_state.num_new_sampled_tokens_per_step,
         )
+        self._engram_memfabric_diagnostic_fence("runner-after-sampled-draft")
 
         # CPU upper bound on seq_lens (num_computed_tokens + num_scheduled_tokens).
         # Added by vLLM PR #40654 to avoid GPU->CPU sync for seq_lens.
@@ -877,11 +906,20 @@ class NPUModelRunner(GPUModelRunner):
             input_batch,
             batch_desc=batch_desc,
         )
+        self._engram_memfabric_diagnostic_fence("runner-after-pcp")
 
         # For mla/sfa, update cos/sin. Here is for execute_model.
         update_cos_sin(input_batch.positions)
+        self._engram_memfabric_diagnostic_fence("runner-after-update-cos-sin")
 
         return input_batch
+
+    def prepare_attn(self, input_batch: AscendInputBatch) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Fence the inherited block/slot preparation without duplicating it."""
+        self._engram_memfabric_diagnostic_fence("runner-attn-entry")
+        result = super().prepare_attn(input_batch)
+        self._engram_memfabric_diagnostic_fence("runner-attn-exit")
+        return result
 
     def prepare_dummy_attn(
         self, input_batch: AscendInputBatch, valid_state_slots: bool = False

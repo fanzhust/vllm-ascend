@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_ascend.ascend_config import AscendConfig
+from vllm_ascend.ascend_config import AscendConfig, EngramMemFabricConfig
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 
@@ -18,3 +18,33 @@ def test_engram_overlap_hardware_default_and_explicit_override(monkeypatch, devi
     config = AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False), **kwargs)
     expected = device == AscendDeviceType.A5 if explicit is None else explicit
     assert config.multistream_engram_overlap is expected
+
+
+def test_memfabric_config_expands_supported_store_fields():
+    config = EngramMemFabricConfig(
+        store_url_template="tcp://10.0.0.1:{port}/{pool_index}/{tp_rank}",
+        store_port_base=8600,
+    )
+    assert config.store_url_template.format(port=8607, pool_index=7, tp_rank=7).endswith("8607/7/7")
+
+
+def test_memfabric_pool_scope_is_tp_group_only():
+    assert EngramMemFabricConfig().pool_scope == "tp_group"
+    assert EngramMemFabricConfig(pool_scope="tp_group").pool_scope == "tp_group"
+
+    with pytest.raises(ValueError):
+        EngramMemFabricConfig(pool_scope="engram_share_group")
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"store_port_base": 0}, "between 1 and 65535"),
+        ({"strict": False}, "strict=false is not supported"),
+        ({"store_url_template": "tcp://host:{unknown}"}, "supports only"),
+        ({"store_url_template": "x" * 64}, "shorter than 64 bytes"),
+    ],
+)
+def test_memfabric_config_rejects_invalid_store_settings(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        EngramMemFabricConfig(**kwargs)

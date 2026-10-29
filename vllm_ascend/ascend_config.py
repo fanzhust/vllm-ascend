@@ -274,6 +274,37 @@ class AscendWarmupConfig:
     enable_early_nz_warmup: bool = False
 
 
+@config(config=ConfigDict(frozen=True))
+class EngramMemFabricConfig:
+    """MemFabric control-plane settings for Ascend Engram offload."""
+
+    # MemFabric SHARED pools follow one complete TP replica. Each TP rank owns
+    # one slot containing its complete local head shard; DP replicas use
+    # independent pools because acc_offload does not support DP-axis pools.
+    pool_scope: Literal["tp_group"] = "tp_group"
+    store_url_template: str = "tcp://127.0.0.1:{port}"
+    store_port_base: int = 8600
+    strict: bool = True
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if not self.strict:
+            raise ValueError("engram_memfabric.strict=false is not supported; MemFabric failures must be explicit")
+        if not 1 <= self.store_port_base <= 65535:
+            raise ValueError("engram_memfabric.store_port_base must be between 1 and 65535")
+        try:
+            expanded = self.store_url_template.format(port=self.store_port_base, pool_index=0, tp_rank=0)
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                "engram_memfabric.store_url_template supports only {port}, {pool_index}, and {tp_rank}"
+            ) from exc
+        if not expanded:
+            raise ValueError("engram_memfabric.store_url_template must not be empty")
+        if len(expanded.encode()) >= 64:
+            raise ValueError("expanded engram_memfabric.store_url_template must be shorter than 64 bytes")
+        return self
+
+
 @config
 class EplbConfig:
     """Configuration Object for ``additional_config["eplb_config"]``.
@@ -425,6 +456,13 @@ class AscendConfig:
             "enable_cpu_binding": true,
             "multistream_dsv4_dsa_overlap": true,
             "multistream_engram_overlap": true,
+            "engram_offload_backend": "host_uva",
+            "engram_memfabric": {
+                "pool_scope": "tp_group",
+                "store_url_template": "tcp://127.0.0.1:{port}",
+                "store_port_base": 8600,
+                "strict": true
+            },
             "enable_prefill_mc2": false,
             "multistream_overlap_shared_expert": false,
             "enable_kv_nz": false,
@@ -571,9 +609,12 @@ class AscendConfig:
     # FULL graphs wait on descriptor-specific external events at consumers.
     # Default to overlap on A5 only; explicit settings override this policy.
     multistream_engram_overlap: bool = dataclasses.field(
-        default_factory=lambda: get_current_hardware_profile().device_adaptor_family
-        == DeviceAdaptorFamily.FP8_OPTIMIZED
+        default_factory=lambda: (
+            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+        )
     )
+    engram_offload_backend: Literal["host_uva", "memfabric"] = "host_uva"
+    engram_memfabric: EngramMemFabricConfig = dataclasses.field(default_factory=EngramMemFabricConfig)
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
@@ -693,6 +734,18 @@ class AscendConfig:
             # DP-dummy ranks have no hash work in MRV2. Share host tables so
             # replicas do not require matching embedding collectives each step.
             engram_config.dp_shared_memory = True
+        if self.engram_offload_backend == "memfabric":
+            if engram_config is None or not engram_config.cpu_offload:
+                raise ValueError(
+                    "additional_config.engram_offload_backend='memfabric' requires "
+                    "--engram-config with cpu_offload=true"
+                )
+            if vc.parallel_config.prefill_context_parallel_size != 1:
+                raise ValueError("MemFabric Engram offload currently requires prefill_context_parallel_size=1")
+            if vc.parallel_config.data_parallel_size > 1 and not engram_config.dp_shared_memory:
+                raise ValueError("MemFabric Engram offload with data parallelism requires dp_shared_memory=true")
+            if not get_current_hardware_profile().supports(HardwareCapability.ENGRAM_MEMFABRIC):
+                raise ValueError("MemFabric Engram offload currently supports only Ascend A3")
         if (
             self.enable_force_eplb
             and self.eplb_config.dynamic_eplb

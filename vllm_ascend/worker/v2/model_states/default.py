@@ -137,9 +137,21 @@ class AscendModelState(DefaultModelState):
         }
 
     def prepare_inputs(self, input_batch, req_states) -> dict[str, Any]:
+        self._engram_memfabric_diagnostic_fence("model-state-input-entry")
         model_inputs = super().prepare_inputs(input_batch, req_states)
+        self._engram_memfabric_diagnostic_fence("model-state-input-base-ready")
         model_inputs.update(self.prepare_engram_inputs(input_batch, req_states))
         return model_inputs
+
+    def _engram_memfabric_diagnostic_fence(self, stage: str) -> None:
+        fence = getattr(self.model, "engram_memfabric_diagnostic_fence", None)
+        if fence is not None:
+            fence(stage)
+
+    def preprocess_state(self, input_batch, block_tables, kv_cache_config, num_computed_tokens) -> None:
+        self._engram_memfabric_diagnostic_fence("model-state-preprocess-entry")
+        super().preprocess_state(input_batch, block_tables, kv_cache_config, num_computed_tokens)
+        self._engram_memfabric_diagnostic_fence("model-state-preprocess-exit")
 
     def prepare_engram_inputs(self, input_batch, req_states) -> dict[str, Any]:
         """Model-specific history providers override this single preparation hook."""
@@ -179,6 +191,7 @@ class AscendModelState(DefaultModelState):
         """Override prepare_attn method because `build_attn_metadata` is different from vllm."""
         # vLLM #50945 adds this contract; Ascend still disables DBO.
         assert ubatch_idx == 0, "DBO is not supported on Ascend"
+        self._engram_memfabric_diagnostic_fence("model-state-attn-entry")
         if cudagraph_mode == CUDAGraphMode.FULL:
             # Use padded sizes - padding is handled by model_runner.prepare_attn.
             num_reqs = input_batch.num_reqs_after_padding
@@ -272,6 +285,7 @@ class AscendModelState(DefaultModelState):
         build_metadata: Callable[..., Any] = build_attn_metadata
         if self.device_metadata is not None:
             build_metadata = partial(self.device_metadata.run_build, build_attn_metadata)
+        self._engram_memfabric_diagnostic_fence("model-state-attn-before-build")
         self.attn_metadata = build_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -306,10 +320,12 @@ class AscendModelState(DefaultModelState):
             copy_sfa_restore_tails=restore_copy_sfa_tails,
             draft_layer_names=getattr(self, "_offload_draft_layer_names", None),
         )
+        self._engram_memfabric_diagnostic_fence("model-state-attn-after-build")
         if restore_copy_sfa_tails:
             manager = get_sparse_kv_offload_manager()
             for metadata in self.attn_metadata.values():
                 if getattr(metadata, "copy_sfa_copy_src_offsets", None) is not None:
                     manager.restore_copy_sfa_tails(metadata)
                     break
+        self._engram_memfabric_diagnostic_fence("model-state-attn-exit")
         return self.attn_metadata

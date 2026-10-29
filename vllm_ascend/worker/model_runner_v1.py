@@ -1275,6 +1275,13 @@ class NPUModelRunner(GPUModelRunner):
 
         self.maybe_save_ec_to_connector({mm_hash: output}, mm_hash)
 
+    def _engram_memfabric_diagnostic_fence(self, stage: str) -> None:
+        """Fence a V1 input/forward stage only in explicit MF diagnostics."""
+        model = getattr(self, "model", None)
+        fence = getattr(model, "engram_memfabric_diagnostic_fence", None)
+        if fence is not None:
+            fence(stage)
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1299,6 +1306,7 @@ class NPUModelRunner(GPUModelRunner):
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
+        self._engram_memfabric_diagnostic_fence("v1-prepare-block-table")
 
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
@@ -1350,6 +1358,7 @@ class NPUModelRunner(GPUModelRunner):
         ):
             self.prev_positions.copy_to_gpu(num_reqs)
             prev_positions_gpu = self.prev_positions.gpu[:num_reqs]
+            self._engram_memfabric_diagnostic_fence("v1-prepare-prev-positions")
 
         if self.speculative_config and self.use_dcp:
             self.dcp_manager.generate_dcp_mtp_input(
@@ -1366,6 +1375,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.num_spec_tokens,
                 prev_positions=prev_positions_gpu,
             )
+            self._engram_memfabric_diagnostic_fence("v1-prepare-dcp-mtp-input")
 
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
 
@@ -1432,6 +1442,7 @@ class NPUModelRunner(GPUModelRunner):
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
         self.query_start_loc.copy_to_gpu()
+        self._engram_memfabric_diagnostic_fence("v1-prepare-query-start-loc")
 
         # Now, query_start_loc is padded.
         # But gdn needs an unpadded one.
@@ -1442,6 +1453,7 @@ class NPUModelRunner(GPUModelRunner):
             self.gdn_query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
             self.gdn_query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
             self.gdn_query_start_loc.copy_to_gpu()
+            self._engram_memfabric_diagnostic_fence("v1-prepare-gdn-query-start-loc")
 
 
         # Compute optimistic seq_lens (assumes all draft tokens from previous
@@ -1457,9 +1469,11 @@ class NPUModelRunner(GPUModelRunner):
 
         # Fill unused with -1. Needed for reshape_and_cache in attention_cp
         self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
+        self._engram_memfabric_diagnostic_fence("v1-prepare-query-start-padding")
 
         # Copy the tensors to the NPU.
         self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
+        self._engram_memfabric_diagnostic_fence("v1-prepare-input-ids")
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -1469,6 +1483,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.mrope_positions.cpu,
                 non_blocking=True,
             )
+            self._engram_memfabric_diagnostic_fence("v1-prepare-mrope")
 
         # Record the index of requests that should not be sampled,
         # so that we could clear the sampled tokens before returning
@@ -1485,6 +1500,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.discard_request_mask.np[:num_reqs] = discard_requests_mask
         self.discard_request_mask.copy_to_gpu(num_reqs)
+        self._engram_memfabric_diagnostic_fence("v1-prepare-discard-metadata")
 
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
@@ -1498,6 +1514,7 @@ class NPUModelRunner(GPUModelRunner):
         else:
             self.num_accepted_tokens.np.fill(1)
             self.num_accepted_tokens.gpu.fill_(1)
+        self._engram_memfabric_diagnostic_fence("v1-prepare-accepted-tokens")
 
         # Update num_computed_tokens on GPU. In async spec decode,
         # CPU values are optimistic (all drafts accepted). The kernel
@@ -1529,15 +1546,19 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                 non_blocking=True,
             )
+        self._engram_memfabric_diagnostic_fence("v1-prepare-computed-tokens")
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
         req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
+        self._engram_memfabric_diagnostic_fence("v1-prepare-request-indices")
 
         self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
+        self._engram_memfabric_diagnostic_fence("v1-prepare-query-positions")
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
         self.num_scheduled_tokens.copy_to_gpu(num_reqs)
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
+        self._engram_memfabric_diagnostic_fence("v1-prepare-scheduled-tokens")
 
         dcp_manager = getattr(self, "dcp_manager", None)
         if dcp_manager is not None:
@@ -1578,6 +1599,7 @@ class NPUModelRunner(GPUModelRunner):
                 rebuilt=False,
                 positions_ready_on_device=False,
             )
+        self._engram_memfabric_diagnostic_fence("v1-prepare-dcp-rebuild")
 
         if cp_async_rebuild.positions_ready_on_device:
             pass
@@ -1596,11 +1618,13 @@ class NPUModelRunner(GPUModelRunner):
                 self.num_computed_tokens[req_indices_gpu].to(torch.int64)
                 + self.query_pos.gpu[:total_num_scheduled_tokens]
             )
+        self._engram_memfabric_diagnostic_fence("v1-prepare-model-positions")
 
         self.seq_lens[:num_reqs] = (
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
         self.seq_lens[num_reqs:].fill_(0)
+        self._engram_memfabric_diagnostic_fence("v1-prepare-sequence-lengths")
 
         # In async spec decode mode, optimistic_seq_lens_cpu assumes all
         # tokens from the previous speculative step were accepted. Correct it
@@ -1621,6 +1645,7 @@ class NPUModelRunner(GPUModelRunner):
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
         )
+        self._engram_memfabric_diagnostic_fence("v1-prepare-slot-mapping")
 
         if self.use_async_spec_decode and self.uses_mrope:
             drift = self.num_computed_tokens[req_indices_gpu].to(
@@ -1674,6 +1699,7 @@ class NPUModelRunner(GPUModelRunner):
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
             self.num_decode_draft_tokens.copy_to_gpu()
+            self._engram_memfabric_diagnostic_fence("v1-prepare-spec-metadata")
         self.logits_indices = logits_indices
 
         # Hot-Swap lora model
@@ -2228,6 +2254,9 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # Use the same entry marker as the V2 runner so the model-side
+        # diagnostic counter is consistent across runner implementations.
+        self._engram_memfabric_diagnostic_fence("runner-input-entry")
         self._cpp_execution_time_ms = None
         profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
         execution_start_time = _start_profiling_chunk_timing(
@@ -2306,6 +2335,7 @@ class NPUModelRunner(GPUModelRunner):
                 deferred_state_corrections_fn = self._update_states(
                     scheduler_output
                 )
+                self._engram_memfabric_diagnostic_fence("v1-runner-after-update-states")
 
                 if has_ec_transfer() and not get_ec_transfer().is_consumer:
                     self._start_dump_data(scheduled_tokens = scheduler_output.num_scheduled_tokens)
@@ -2359,6 +2389,7 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output,
                     num_scheduled_tokens_np,
                 )
+                self._engram_memfabric_diagnostic_fence("v1-runner-after-prepare-inputs")
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 cascade_attn_prefix_lens = None
@@ -2386,6 +2417,7 @@ class NPUModelRunner(GPUModelRunner):
                     force_eager=self.model_config.enforce_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
+                self._engram_memfabric_diagnostic_fence("v1-runner-after-batch-padding")
 
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
@@ -2489,6 +2521,7 @@ class NPUModelRunner(GPUModelRunner):
                         batch_desc.num_reqs,
                     )
 
+                self._engram_memfabric_diagnostic_fence("v1-runner-before-attention-metadata")
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,
@@ -2504,11 +2537,13 @@ class NPUModelRunner(GPUModelRunner):
                     cudagraph_runtime_mode=cudagraph_mode,
                     batch_descriptor=batch_desc,
                 )
+                self._engram_memfabric_diagnostic_fence("v1-runner-after-attention-metadata")
 
                 self._sanitize_placeholder_input_ids_for_forward(
                     scheduler_output,
                     num_tokens_padded,
                 )
+                self._engram_memfabric_diagnostic_fence("v1-runner-after-sanitize-input-ids")
 
             (
                 input_ids,
@@ -2522,9 +2557,11 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_padded,
                 intermediate_tensors,
             )
+            self._engram_memfabric_diagnostic_fence("v1-runner-after-preprocess")
 
             # update global cos, sin
             update_cos_sin(positions)
+            self._engram_memfabric_diagnostic_fence("v1-runner-after-update-cos-sin")
 
         if self.kvpp.scheduler is not None:
             self.kvpp.prepare_forward(bool(np.any(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)))
@@ -2546,6 +2583,7 @@ class NPUModelRunner(GPUModelRunner):
             get_pp_group().is_last_rank or self.broadcast_pp_output
         )
         active_device_metadata_executor = self._prepare_device_metadata_for_forward(cudagraph_mode)
+        self._engram_memfabric_diagnostic_fence("v1-runner-after-device-metadata")
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2590,9 +2628,11 @@ class NPUModelRunner(GPUModelRunner):
                         mamba_copy_connector = connector
                 if mamba_copy_connector is None:
                     mamba_utils.do_mamba_copy_block(preprocess_bufs)
+            self._engram_memfabric_diagnostic_fence("v1-runner-before-model-forward")
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            self._engram_memfabric_diagnostic_fence("v1-runner-after-model-forward")
             self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
                 profiling_chunk_config,
                 execution_start_time,
@@ -3212,6 +3252,7 @@ class NPUModelRunner(GPUModelRunner):
         # Routing runs before replay on every DP, never inside capture.
         prepare_engram = getattr(self.model, "prepare_engram_inputs", None)
         if prepare_engram is not None:
+            self._engram_memfabric_diagnostic_fence("v1-model-before-prepare-engram")
             if (
                 getattr(self, "_engram_capture_active", False)
                 or getattr(forward_context, "capturing", False)
@@ -3236,6 +3277,7 @@ class NPUModelRunner(GPUModelRunner):
                         **self._get_engram_device_inputs(),
                     )
                 )
+            self._engram_memfabric_diagnostic_fence("v1-model-after-prepare-engram")
         run_model = partial(self.model, **model_inputs)
 
         try:
@@ -4366,6 +4408,13 @@ class NPUModelRunner(GPUModelRunner):
         else:
             # collect eplb heat for all requests.
             self.eplb_heat_collection_status =  True
+
+    def shutdown(self) -> None:
+        model = getattr(self, "model", None)
+        close_engram = getattr(model, "close_engram_offload", None)
+        if callable(close_engram):
+            close_engram()
+        super().shutdown()
 
     def load_model(self) -> None:
         from vllm_ascend.model_executor.warmup.early_kernel_warmup import (

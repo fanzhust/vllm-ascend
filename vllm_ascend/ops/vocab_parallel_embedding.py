@@ -295,6 +295,12 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
             return self._forward_with_token_exchange(input_)
         return self._forward_standard(input_)
 
+    def _run_forward_stage_hook(self, stage: str, tensor: torch.Tensor) -> None:
+        """Run an optional eager-only diagnostic hook between embedding stages."""
+        hook = getattr(self, "_vllm_ascend_forward_stage_hook", None)
+        if hook is not None:
+            hook(stage, tensor)
+
     def _forward_with_token_exchange(self, input_):
         """Exchange token rows before lookup and restore local token rows.
 
@@ -406,6 +412,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         return output
 
     def _forward_standard(self, input_):
+        self._run_forward_stage_hook("entry", input_)
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = self._mask_input_for_vocab_range(
@@ -418,13 +425,16 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
             )
         else:
             masked_input = input_
+        self._run_forward_stage_hook("after-input-mask", masked_input)
         # Get the embeddings.
         output_parallel = self.quant_method.embedding(self, masked_input.long())
+        self._run_forward_stage_hook("after-local-lookup", output_parallel)
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         else:
             return output_parallel
+        self._run_forward_stage_hook("after-output-mask", output_parallel)
 
         reduce_group = self.output_reduce_group
         if reduce_group is None or reduce_group.world_size == 1:
@@ -432,7 +442,9 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         # Standard vocabulary parallelism keeps identical token rows on every
         # rank. Sum the vocabulary-shard contributions without scattering the
         # token dimension; the first decoder layer expects the complete sequence.
-        return torch.ops.vllm.all_reduce(output_parallel, reduce_group.unique_name)
+        output = torch.ops.vllm.all_reduce(output_parallel, reduce_group.unique_name)
+        self._run_forward_stage_hook("after-tp-all-reduce", output)
+        return output
 
 
 class AscendParallelLMHead(ParallelLMHead):

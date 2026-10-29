@@ -86,6 +86,8 @@ class HardwareCapability(Enum):
     ENGRAM_UNROTATED_GATE = auto()
     # Decode native FP8 codes and E8M0 group scales in Engram table lookups.
     ENGRAM_MXFP8 = auto()
+    # Access MemFabric SHARED Host DRAM through the A3 MTE entry-gather ABI.
+    ENGRAM_MEMFABRIC = auto()
     # Enable dynamic-MX norm fusion and the associated ``wo_a`` weight-layout contract.
     DYNAMIC_MX_QUANT_FUSION = auto()
     # Select DynamicMxQuantV3 ``scale_alg=1`` for model paths that require it.
@@ -277,6 +279,7 @@ _STANDARD_CAPABILITIES = frozenset(
 )
 _A3_CAPABILITIES = _STANDARD_CAPABILITIES | {
     HardwareCapability.GMM_DEQUANT_SITU_QUANT,
+    HardwareCapability.ENGRAM_MEMFABRIC,
     HardwareCapability.MC2_FULLMESH_V2_COMM,
     HardwareCapability.RMS_NORM_CAST,
 }
