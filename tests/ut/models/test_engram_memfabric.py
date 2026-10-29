@@ -15,6 +15,7 @@ pytest.importorskip(
     reason="DeepSeek V4.1 is unavailable on this vLLM release",
 )
 
+from vllm_ascend.model_executor.warmup import engram_memfabric_warmup as ordered_warmup
 from vllm_ascend.models.deepseek_v41 import model as model_mod
 from vllm_ascend.models.deepseek_v41.engram import embedding as embedding_mod
 from vllm_ascend.models.deepseek_v41.engram import memfabric as memfabric_mod
@@ -155,6 +156,49 @@ def test_memfabric_entry_contains_codes_and_fp32_scales():
     assert SCALE_COUNT == 8
     assert SCALE_BYTES == 32
     assert ENTRY_BYTES == 288
+
+
+def test_ordered_warmup_materializes_hccl_before_aicpu(monkeypatch):
+    events = []
+
+    class Backend:
+        def get_hccl_comm_name(self, rank):
+            events.append(("communicator", rank))
+            return "comm"
+
+    class Group:
+        def _get_backend(self, device):
+            events.append(("backend", device.type))
+            return Backend()
+
+    coordinator = SimpleNamespace(device_group=Group())
+    vllm_config = SimpleNamespace(
+        engram_config=SimpleNamespace(cpu_offload=True),
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(engram_layer_ids=(1,))),
+    )
+    monkeypatch.setattr(
+        ordered_warmup,
+        "get_ascend_config",
+        lambda: SimpleNamespace(engram_offload_backend="memfabric"),
+    )
+    monkeypatch.setattr(ordered_warmup, "enable_custom_op", lambda: True)
+    monkeypatch.setattr(ordered_warmup, "get_mc2_group", lambda: coordinator)
+    monkeypatch.setattr(ordered_warmup, "get_ep_group", lambda: coordinator)
+    monkeypatch.setattr(ordered_warmup.torch.distributed, "get_rank", lambda *, group: 0)
+    monkeypatch.setattr(
+        ordered_warmup,
+        "_warm_up_sparse_flash_mla_metadata",
+        lambda _: events.append(("aicpu",)),
+    )
+
+    assert ordered_warmup.warm_up_before_memfabric_engram(vllm_config, torch.device("cpu"))
+    assert events == [
+        ("backend", "npu"),
+        ("communicator", 0),
+        ("backend", "npu"),
+        ("communicator", 0),
+        ("aicpu",),
+    ]
 
 
 def test_memfabric_runner_fence_is_limited_to_full_bypass_diagnostics(monkeypatch):
