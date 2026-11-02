@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 import typing
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
@@ -25,6 +27,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -89,11 +92,180 @@ from .engram.common import load_engram_rotation_block
 from .engram.embedding import (
     AscendParallelEngramEmbedding,
     engram_storage_dtype,
+    memfabric_bypass_fence_enabled,
+    memfabric_full_bypass_enabled,
     preflight_engram_checkpoint,
 )
 from .engram.layer import AscendEngram
+from .engram.memfabric import MemFabricEngramSession
 from .engram.parallel import gather_engram_hashes, resolve_dp_shared_memory
 from .indexer import DeepseekV41Indexer
+
+_ENGRAM_MF_TRACE = os.getenv("VLLM_ASCEND_ENGRAM_MF_TRACE", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_ENGRAM_TRACE_ALL = os.getenv("VLLM_ASCEND_ENGRAM_TRACE_ALL", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_ENGRAM_MF_LAYER_TRACE = os.getenv("VLLM_ASCEND_ENGRAM_MF_LAYER_TRACE", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_ENGRAM_MF_LAYER_TRACE_DEVICES = {
+    int(item)
+    for item in os.getenv("VLLM_ASCEND_ENGRAM_MF_LAYER_TRACE_DEVICES", "").split(",")
+    if item.strip()
+}
+_ENGRAM_MF_DECODER_TRACE_LAYERS = {
+    int(item)
+    for item in os.getenv("VLLM_ASCEND_ENGRAM_MF_DECODER_TRACE_LAYERS", "0").split(",")
+    if item.strip()
+}
+try:
+    _ENGRAM_MF_LAYER_TRACE_CALLS = max(0, int(os.getenv("VLLM_ASCEND_ENGRAM_MF_LAYER_TRACE_CALLS", "4")))
+except ValueError:
+    _ENGRAM_MF_LAYER_TRACE_CALLS = 4
+try:
+    _ENGRAM_MF_TRACE_CALLS = max(0, int(os.getenv("VLLM_ASCEND_ENGRAM_MF_TRACE_CALLS", "2")))
+except ValueError:
+    _ENGRAM_MF_TRACE_CALLS = 2
+_engram_mf_prepare_trace_count = 0
+_engram_mf_decoder_trace_counts: dict[tuple[int, int], int] = {}
+
+
+def _begin_engram_mf_layer_trace(model, positions: torch.Tensor) -> int | None:
+    session = model._engram_offload_session
+    if not _ENGRAM_MF_LAYER_TRACE or _ENGRAM_MF_LAYER_TRACE_CALLS == 0 or session is None:
+        return None
+    device_id = session.topology.device_id
+    if _ENGRAM_MF_LAYER_TRACE_DEVICES and device_id not in _ENGRAM_MF_LAYER_TRACE_DEVICES:
+        return None
+    previous = getattr(model, "_engram_mf_layer_trace_count", 0)
+    if previous >= _ENGRAM_MF_LAYER_TRACE_CALLS:
+        return None
+    call = previous + 1
+    model._engram_mf_layer_trace_count = call
+    logger.warning(
+        "[Engram MF layer trace] FORWARD BEGIN device=%d mf_rank=%d call=%d tokens=%d",
+        device_id,
+        session.topology.rank_id,
+        call,
+        positions.shape[0],
+    )
+    return call
+
+
+def _engram_mf_layer_trace(model, call: int | None, layer_idx: int, stage: str) -> None:
+    if call is None:
+        return
+    session = model._engram_offload_session
+    logger.warning(
+        "[Engram MF layer trace] device=%d mf_rank=%d call=%d layer=%d stage=%s",
+        session.topology.device_id,
+        session.topology.rank_id,
+        call,
+        layer_idx,
+        stage,
+    )
+
+
+def _begin_engram_mf_decoder_trace(layer, hidden_states: torch.Tensor) -> int | None:
+    if not _ENGRAM_MF_LAYER_TRACE or layer.layer_idx not in _ENGRAM_MF_DECODER_TRACE_LAYERS:
+        return None
+    device_id = hidden_states.device.index
+    if device_id is None:
+        return None
+    if _ENGRAM_MF_LAYER_TRACE_DEVICES and device_id not in _ENGRAM_MF_LAYER_TRACE_DEVICES:
+        return None
+    key = (device_id, layer.layer_idx)
+    previous = _engram_mf_decoder_trace_counts.get(key, 0)
+    if previous >= _ENGRAM_MF_LAYER_TRACE_CALLS:
+        return None
+    call = previous + 1
+    _engram_mf_decoder_trace_counts[key] = call
+    logger.warning(
+        "[Engram MF decoder trace] BEGIN device=%d call=%d layer=%d tokens=%d",
+        device_id,
+        call,
+        layer.layer_idx,
+        hidden_states.shape[0],
+    )
+    return call
+
+
+def _engram_mf_decoder_trace(
+    layer, hidden_states: torch.Tensor, call: int | None, stage: str
+) -> None:
+    if call is None:
+        return
+    logger.warning(
+        "[Engram MF decoder trace] device=%d call=%d layer=%d stage=%s",
+        hidden_states.device.index,
+        call,
+        layer.layer_idx,
+        stage,
+    )
+
+
+def _begin_engram_mf_prepare_trace(model, input_ids: torch.Tensor) -> int | None:
+    """Start one synchronization-heavy trace of the pre-lookup pipeline."""
+    global _engram_mf_prepare_trace_count
+    memfabric_trace = _ENGRAM_MF_TRACE and model._engram_offload_session is not None
+    if (
+        not (memfabric_trace or _ENGRAM_TRACE_ALL)
+        or _ENGRAM_MF_TRACE_CALLS == 0
+        or _engram_mf_prepare_trace_count >= _ENGRAM_MF_TRACE_CALLS
+    ):
+        return None
+    _engram_mf_prepare_trace_count += 1
+    call = _engram_mf_prepare_trace_count
+    logger.warning(
+        "[Engram trace] PREPARE BEGIN backend=%s call=%d input_shape=%s input_dtype=%s device=%s",
+        "memfabric" if model._engram_offload_session is not None else "non-memfabric",
+        call,
+        tuple(input_ids.shape),
+        input_ids.dtype,
+        input_ids.device,
+    )
+    return call
+
+
+def _engram_mf_prepare_trace_synchronize(call: int | None, stage: str) -> None:
+    if call is None:
+        return
+    logger.warning("[Engram trace] PREPARE call=%d %s current-stream query begin", call, stage)
+    stream = torch.npu.current_stream()
+    logger.warning(
+        "[Engram trace] PREPARE call=%d %s current-stream object returned object_id=0x%x",
+        call,
+        stage,
+        id(stream),
+    )
+    logger.warning("[Engram trace] PREPARE call=%d %s stream-handle query begin", call, stage)
+    stream_handle = stream.npu_stream
+    logger.warning(
+        "[Engram trace] PREPARE call=%d %s stream-handle query returned stream=0x%x",
+        call,
+        stage,
+        stream_handle,
+    )
+    logger.warning("[Engram trace] PREPARE call=%d %s synchronize begin", call, stage)
+    started = time.perf_counter()
+    stream.synchronize()
+    logger.warning(
+        "[Engram trace] PREPARE call=%d %s synchronize done elapsed_ms=%.3f",
+        call,
+        stage,
+        (time.perf_counter() - started) * 1000,
+    )
 
 
 def _engram_enabled_for_runtime(config, vllm_config) -> bool:
@@ -884,6 +1056,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         llama_4_scaling=None,
         input_ids=None,
     ):
+        decoder_trace_call = _begin_engram_mf_decoder_trace(self, hidden_states)
         use_sequence_parallel = getattr(self, "use_sequence_parallel", False)
         residual = hidden_states
         x, attn_post, attn_comb, attn_pre = self.hc_pre(
@@ -893,13 +1066,19 @@ class DeepseekV41DecoderLayer(nn.Module):
             self.hc_attn_base,
             pre_mix,
         )
+        _engram_mf_decoder_trace(self, hidden_states, decoder_trace_call, "hc-attn-pre-returned")
         x = self.input_layernorm(x)
+        _engram_mf_decoder_trace(self, hidden_states, decoder_trace_call, "input-norm-returned")
         if use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
+            _engram_mf_decoder_trace(self, hidden_states, decoder_trace_call, "sp-all-gather-returned")
         x = self.self_attn(positions, x, llama_4_scaling)
+        _engram_mf_decoder_trace(self, hidden_states, decoder_trace_call, "attention-returned")
         if use_sequence_parallel:
             x = sp_reduce_scatter(x)
+            _engram_mf_decoder_trace(self, hidden_states, decoder_trace_call, "sp-reduce-scatter-returned")
         hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
+        _engram_mf_decoder_trace(self, hidden_states, decoder_trace_call, "hc-attn-post-returned")
 
         residual = hidden_states
         x, ffn_post, ffn_comb, ffn_pre = self.hc_pre(
@@ -909,14 +1088,18 @@ class DeepseekV41DecoderLayer(nn.Module):
             self.hc_ffn_base,
             attn_pre,
         )
+        _engram_mf_decoder_trace(self, hidden_states, decoder_trace_call, "hc-ffn-pre-returned")
         x, x_fp32 = self.rms_norm_cast(x)
+        _engram_mf_decoder_trace(self, hidden_states, decoder_trace_call, "ffn-norm-returned")
         x = self.mlp(
             x,
             input_ids=input_ids,
             hidden_states_fp32=x_fp32,
             already_sequence_parallel=use_sequence_parallel,
         )
+        _engram_mf_decoder_trace(self, hidden_states, decoder_trace_call, "mlp-returned")
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
+        _engram_mf_decoder_trace(self, hidden_states, decoder_trace_call, "hc-ffn-post-returned")
         return hidden_states, ffn_pre
 
 
@@ -930,10 +1113,86 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
 
         config = normalize_deepseek_v41_config(vllm_config.model_config.hf_config)
         quant_config = vllm_config.quant_config
+        ascend_config = get_ascend_config()
         self.config = config
         self.has_engram = _engram_enabled_for_runtime(config, vllm_config)
         self.device = current_platform.device_type
         self.use_sequence_parallel_moe = vllm_config.parallel_config.use_sequence_parallel_moe
+
+        # Reserve and map the MemFabric GVA before constructing any model
+        # parameters or long-lived NPU buffers.  SHARED initialization imports
+        # peer slices into the device address space; doing that after
+        # make_layers() leaves HYBM to modify an already-populated torch_npu
+        # address space and is observably unsafe for a world-size > 1 pool.
+        # Distributed groups already exist when model construction starts, so
+        # the TP pool topology is available here without delaying the map.
+        self.engram_root = vllm_config.model_config.model
+        self.engram_weight_root = self.engram_root
+        cpu_offload = engram_cpu_offload(vllm_config)
+        self.engram_dp_shared_memory = resolve_dp_shared_memory(
+            bool(vllm_config.engram_config and vllm_config.engram_config.dp_shared_memory)
+        )
+        self._engram_offload_session = None
+        self._engram_max_tokens = max(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+        )
+        self.engram_layout = EngramLayout.from_config(config) if self.has_engram else None
+        prepared = []
+        if self.engram_layout is not None:
+            # Keep checkpoint validation ahead of the large DRAM reservation.
+            if vllm_config.load_config.load_format != "dummy":
+                preflight_engram_checkpoint(
+                    self.engram_weight_root, config.engram_layer_ids, AscendParallelEngramEmbedding
+                )
+            native_mxfp8 = get_current_hardware_profile().supports(HardwareCapability.ENGRAM_MXFP8)
+            use_memfabric = ascend_config.engram_offload_backend == "memfabric"
+            if use_memfabric and get_engram_dp_size() > 1 and not self.engram_dp_shared_memory:
+                raise ValueError(
+                    "MemFabric Engram with more than one DP rank requires dp_shared_memory=true; "
+                    "each DP replica owns a complete TP-scoped pool and does not use per-step DP row exchange"
+                )
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            for slot, (layer_id, rows) in enumerate(zip(config.engram_layer_ids, config.engram_num_embeddings)):
+                head_sizes = tuple(size for order in self.engram_layout.primes[slot] for size in order)
+                local_heads = 0
+                part_rows = 0
+                if use_memfabric:
+                    if len(head_sizes) % tp_size:
+                        raise ValueError(
+                            "MemFabric Engram requires uniform TP head shards: "
+                            f"{len(head_sizes)} heads over TP{tp_size}"
+                        )
+                    local_heads = len(head_sizes) // tp_size
+                    head_start = tp_rank * local_heads
+                    part_rows = sum(head_sizes[head_start : head_start + local_heads])
+                storage_dtype = torch.bfloat16 if vllm_config.quant_config is None else torch.int8
+                if vllm_config.load_config.load_format != "dummy":
+                    storage_dtype = engram_storage_dtype(self.engram_weight_root, layer_id)
+                    if storage_dtype == torch.float8_e4m3fn and not native_mxfp8:
+                        storage_dtype = torch.int8
+                elif native_mxfp8 and vllm_config.quant_config is not None:
+                    storage_dtype = torch.float8_e4m3fn
+                if use_memfabric and storage_dtype != torch.int8:
+                    raise ValueError(
+                        f"MemFabric Engram requires A3 INT8/FP32 storage; layer {layer_id} resolved to {storage_dtype}"
+                    )
+                prepared.append((slot, layer_id, rows, head_sizes, local_heads, part_rows, storage_dtype))
+
+            if use_memfabric:
+                logger.info(
+                    "Initializing MemFabric Engram GVA before model NPU allocations: "
+                    "layers=%d max_tokens=%d",
+                    len(prepared),
+                    self._engram_max_tokens,
+                )
+                self._engram_offload_session = MemFabricEngramSession(
+                    [(slot, part_rows, local_heads) for slot, _, _, _, local_heads, part_rows, _ in prepared],
+                    self._engram_max_tokens,
+                    ascend_config.engram_memfabric,
+                )
+                logger.info("Initialized MemFabric Engram GVA before model NPU allocations")
 
         self.vocab_size = config.vocab_size
         if hasattr(config, "index_topk"):
@@ -965,6 +1224,30 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             lambda prefix: self.decoder_layer_cls(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
             prefix=f"{prefix}.layers",
         )
+
+        if self.engram_layout is not None:
+            try:
+                for slot, layer_id, rows, head_sizes, _, _, storage_dtype in prepared:
+                    table = (
+                        self._engram_offload_session.table(slot) if self._engram_offload_session is not None else None
+                    )
+                    embed = AscendParallelEngramEmbedding(
+                        rows,
+                        config.engram_head_dim,
+                        head_sizes,
+                        slot,
+                        storage_dtype=storage_dtype,
+                        cpu_offload=cpu_offload,
+                        dp_shared_memory=self.engram_dp_shared_memory,
+                        memfabric_table=table,
+                    )
+                    embed.bind_checkpoint(self.engram_weight_root, f"layers.{layer_id}.engram.embed.weight")
+                    self.layers[layer_id].engram.embed_tokens = embed
+            except Exception:
+                if self._engram_offload_session is not None:
+                    self._engram_offload_session.close(synchronize_group=False)
+                    self._engram_offload_session = None
+                raise
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1014,48 +1297,6 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         for layer in self.layers:
             if isinstance(layer, DeepseekV41DecoderLayer):
                 layer.self_attn.shared_state = self.shared_attention_state
-        self.engram_root = vllm_config.model_config.model
-        config = self.config
-        self.engram_weight_root = self.engram_root
-        # Detect each table's checkpoint dtype independently of dense weights.
-        # Host placement remains controlled by vLLM's EngramConfig.
-        cpu_offload = engram_cpu_offload(vllm_config)
-        self.engram_dp_shared_memory = resolve_dp_shared_memory(
-            bool(vllm_config.engram_config and vllm_config.engram_config.dp_shared_memory)
-        )
-        self.engram_layout = EngramLayout.from_config(config) if self.has_engram else None
-        if self.engram_layout is not None:
-            # Complete head buckets per rank, laid out over TP and the
-            # node-local EDP group (upstream's, not one built from EP hosts).
-            # Fail on an unreadable checkpoint before the first table exists:
-            # the allocation below is per-rank 24-51 GiB, and discovering a
-            # missing index/key during weight iteration would mean paying for
-            # it first.  `dummy` reads no checkpoint at all.
-            if vllm_config.load_config.load_format != "dummy":
-                preflight_engram_checkpoint(
-                    self.engram_weight_root, config.engram_layer_ids, AscendParallelEngramEmbedding
-                )
-            native_mxfp8 = get_current_hardware_profile().supports(HardwareCapability.ENGRAM_MXFP8)
-            for slot, (layer_id, rows) in enumerate(zip(config.engram_layer_ids, config.engram_num_embeddings)):
-                head_sizes = tuple(size for order in self.engram_layout.primes[slot] for size in order)
-                storage_dtype = torch.bfloat16 if vllm_config.quant_config is None else torch.int8
-                if vllm_config.load_config.load_format != "dummy":
-                    storage_dtype = engram_storage_dtype(self.engram_weight_root, layer_id)
-                    if storage_dtype == torch.float8_e4m3fn and not native_mxfp8:
-                        storage_dtype = torch.int8
-                elif native_mxfp8 and vllm_config.quant_config is not None:
-                    storage_dtype = torch.float8_e4m3fn
-                embed = AscendParallelEngramEmbedding(
-                    rows,
-                    config.engram_head_dim,
-                    head_sizes,
-                    slot,
-                    storage_dtype=storage_dtype,
-                    cpu_offload=cpu_offload,
-                    dp_shared_memory=self.engram_dp_shared_memory,
-                )
-                embed.bind_checkpoint(self.engram_weight_root, f"layers.{layer_id}.engram.embed.weight")
-                self.layers[layer_id].engram.embed_tokens = embed
         self.engram_hash = None
         self._engram_input_buffers = None
         # ExternalEvent pairs for FULL graph capture. V1 keys by the forward
@@ -1065,11 +1306,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         self._engram_prepare_stream = None
         self._engram_capture_stream = None
         self._engram_capture_events = None
-        self._engram_overlap_enabled = get_ascend_config().multistream_engram_overlap
-        self._engram_max_tokens = max(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            vllm_config.compilation_config.max_cudagraph_capture_size or 0,
-        )
+        self._engram_overlap_enabled = ascend_config.multistream_engram_overlap
         rotation_path = get_rotation_path(vllm_config)
         self.engram_rotated = rotation_path is not None
         self.register_buffer("engram_rotation", torch.eye(32), persistent=False)
@@ -1094,6 +1331,168 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
 
     def embed_input_ids(self, input_ids):
         return self.embed_tokens(input_ids)
+
+    def _engram_mf_vocab_embedding_stage_fence(self, stage: str, tensor: torch.Tensor) -> None:
+        """Fence individual vocab-embedding stages for MemFabric diagnosis."""
+        session = self._engram_offload_session
+        assert session is not None
+        if stage == "entry":
+            call = getattr(self, "_engram_mf_vocab_fence_count", 0) + 1
+            self._engram_mf_vocab_fence_count = call
+        else:
+            call = getattr(self, "_engram_mf_vocab_fence_count", 0)
+        logger.warning(
+            "[Engram MF vocab fence] device=%d mf_rank=%d call=%d stage=%s "
+            "synchronize begin shape=%s dtype=%s",
+            session.topology.device_id,
+            session.topology.rank_id,
+            call,
+            stage,
+            tuple(tensor.shape),
+            tensor.dtype,
+        )
+        started = time.perf_counter()
+        torch.npu.current_stream().synchronize()
+        logger.warning(
+            "[Engram MF vocab fence] device=%d mf_rank=%d call=%d stage=%s "
+            "synchronize returned elapsed_ms=%.3f",
+            session.topology.device_id,
+            session.topology.rank_id,
+            call,
+            stage,
+            (time.perf_counter() - started) * 1000,
+        )
+
+    def engram_memfabric_diagnostic_fence(self, stage: str) -> None:
+        """Fence runner preparation stages in MemFabric full-bypass diagnosis."""
+        session = self._engram_offload_session
+        if (
+            session is None
+            or not memfabric_full_bypass_enabled()
+            or not memfabric_bypass_fence_enabled()
+        ):
+            return
+        if stage == "runner-input-entry":
+            call = getattr(self, "_engram_mf_runner_fence_count", 0) + 1
+            self._engram_mf_runner_fence_count = call
+        else:
+            call = getattr(self, "_engram_mf_runner_fence_count", 0)
+        logger.warning(
+            "[Engram MF runner fence] device=%d mf_rank=%d call=%d "
+            "stage=%s synchronize begin",
+            session.topology.device_id,
+            session.topology.rank_id,
+            call,
+            stage,
+        )
+        started = time.perf_counter()
+        torch.npu.current_stream().synchronize()
+        logger.warning(
+            "[Engram MF runner fence] device=%d mf_rank=%d call=%d "
+            "stage=%s synchronize returned elapsed_ms=%.3f",
+            session.topology.device_id,
+            session.topology.rank_id,
+            call,
+            stage,
+            (time.perf_counter() - started) * 1000,
+        )
+
+    def _prepare_engram_memfabric_full_bypass(
+        self,
+        input_ids,
+        positions,
+        *,
+        output_buffers,
+        ready_events,
+        output_tokens,
+        mask_output_buffer,
+        mask_ready_event,
+    ):
+        """Return zero Engram inputs before allocating hash state or launching kernels."""
+        session = self._engram_offload_session
+        assert session is not None
+        num_tokens = input_ids.shape[0]
+        output_tokens = num_tokens if output_tokens is None else output_tokens
+        if not num_tokens <= output_tokens:
+            raise ValueError("Engram full-bypass token count exceeds the output buffer capacity")
+
+        call = getattr(self, "_engram_mf_prepare_bypass_count", 0) + 1
+        self._engram_mf_prepare_bypass_count = call
+        device_id = session.topology.device_id
+        rank_id = session.topology.rank_id
+        logger.warning(
+            "[Engram MF bypass] device=%d mf_rank=%d call=%d mode=full "
+            "stage=prepare-entry tokens=%d output_tokens=%d",
+            device_id,
+            rank_id,
+            call,
+            num_tokens,
+            output_tokens,
+        )
+
+        fence = memfabric_bypass_fence_enabled()
+        if fence:
+            logger.warning(
+                "[Engram MF bypass fence] device=%d mf_rank=%d call=%d "
+                "stage=pre-prepare-output synchronize begin",
+                device_id,
+                rank_id,
+                call,
+            )
+            started = time.perf_counter()
+            torch.npu.current_stream().synchronize()
+            logger.warning(
+                "[Engram MF bypass fence] device=%d mf_rank=%d call=%d "
+                "stage=pre-prepare-output synchronize returned elapsed_ms=%.3f",
+                device_id,
+                rank_id,
+                call,
+                (time.perf_counter() - started) * 1000,
+            )
+
+        if mask_output_buffer is None:
+            returned_mask = torch.zeros(num_tokens, dtype=torch.bool, device=positions.device)
+        else:
+            mask_output_buffer[:output_tokens].zero_()
+            returned_mask = mask_output_buffer
+        if mask_ready_event is not None:
+            mask_ready_event.record(torch.npu.current_stream())
+
+        lookups = {}
+        for layer_id in self.config.engram_layer_ids:
+            table = self.layers[layer_id].engram.embed_tokens
+            if output_buffers is None:
+                target = torch.zeros(
+                    (num_tokens, table.n_hash_cols * table.dim),
+                    dtype=torch.bfloat16,
+                    device=positions.device,
+                )
+            else:
+                target = output_buffers[layer_id]
+                target[:output_tokens].zero_()
+            lookups[layer_id] = target
+            if ready_events is not None:
+                ready_events[layer_id].record(torch.npu.current_stream())
+
+        if fence:
+            logger.warning(
+                "[Engram MF bypass fence] device=%d mf_rank=%d call=%d "
+                "stage=post-prepare-output synchronize begin",
+                device_id,
+                rank_id,
+                call,
+            )
+            started = time.perf_counter()
+            torch.npu.current_stream().synchronize()
+            logger.warning(
+                "[Engram MF bypass fence] device=%d mf_rank=%d call=%d "
+                "stage=post-prepare-output synchronize returned elapsed_ms=%.3f",
+                device_id,
+                rank_id,
+                call,
+                (time.perf_counter() - started) * 1000,
+            )
+        return lookups, returned_mask
 
     def prepare_engram(
         self,
@@ -1121,6 +1520,18 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         config = self.config
         if not self.has_engram:
             return {}, torch.empty(0, dtype=torch.bool, device=positions.device)
+        if self._engram_offload_session is not None and memfabric_full_bypass_enabled():
+            return self._prepare_engram_memfabric_full_bypass(
+                input_ids,
+                positions,
+                output_buffers=output_buffers,
+                ready_events=ready_events,
+                output_tokens=output_tokens,
+                mask_output_buffer=mask_output_buffer,
+                mask_ready_event=mask_ready_event,
+            )
+        trace_call = _begin_engram_mf_prepare_trace(self, input_ids)
+        _engram_mf_prepare_trace_synchronize(trace_call, "prepare-entry")
         device = positions.device
         hash_state = self.engram_hash
         hashing = (
@@ -1174,16 +1585,19 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             publish_mask()
             if lookback_token_ids is None:
                 lookback_token_ids = input_ids.new_full((query_start_loc.numel() - 1, hash_state.lookback_depth), -1)
+            lookback_dead = engram_dead_mask(lookback_token_ids, image_token_id, image_pad_token_id)
+            _engram_mf_prepare_trace_synchronize(trace_call, "pre-hash")
             hashes = hash_state(
                 input_ids,
                 positions,
                 query_start_loc,
                 dead,
                 lookback_token_ids,
-                engram_dead_mask(lookback_token_ids, image_token_id, image_pad_token_id),
+                lookback_dead,
                 slot_mapping,
                 block_table,
             )
+            _engram_mf_prepare_trace_synchronize(trace_call, "post-hash")
         elif participates:
             assert hash_state is not None
             hashes, mask = hash_state.dummy_hashes(input_ids)
@@ -1196,18 +1610,20 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             assert hashes is not None
             # One DP gather feeds every layer sharing the split table.
             gathered = gather_engram_hashes(hashes, dp_shared_memory=self.engram_dp_shared_memory)
+            _engram_mf_prepare_trace_synchronize(trace_call, "post-gather")
             for slot, (layer_id, table) in enumerate(zip(config.engram_layer_ids, tables)):
+                layer_gathered = gathered[:, slot]
+                _engram_mf_prepare_trace_synchronize(trace_call, f"layer-{slot}-post-select")
                 direct = output_buffers is not None and table.dp_size == 1 and table.tp_size == 1
                 if direct:
                     target = output_buffers[layer_id]
                     count = hashes.shape[0]
-                    table.lookup(
-                        gathered[:, slot].contiguous(), target[:count].view(count, table.n_hash_cols, table.dim)
-                    )
+                    table.lookup(layer_gathered, target[:count].view(count, table.n_hash_cols, table.dim))
                     target[count:output_tokens].zero_()
                     lookups[layer_id] = target
                 else:
-                    values = table.embed_gathered(gathered[:, slot], hashes.shape[0]).flatten(1)
+                    values = table.embed_gathered(layer_gathered, hashes.shape[0]).flatten(1)
+                    _engram_mf_prepare_trace_synchronize(trace_call, f"layer-{slot}-post-embed")
                     if output_buffers is None:
                         lookups[layer_id] = values
                     else:
@@ -1321,6 +1737,24 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 for mask_ready, events in self._engram_graph_events.values():
                     for event in (mask_ready, *events.values()):
                         event.reset(main)
+
+    def close_engram_offload(self) -> None:
+        """Deterministically release model-owned Engram host resources."""
+        if not self.has_engram:
+            return
+        session = self._engram_offload_session
+        for layer_id in self.config.engram_layer_ids:
+            layer = self.layers[layer_id]
+            embed = getattr(getattr(layer, "engram", None), "embed_tokens", None)
+            if not isinstance(embed, AscendParallelEngramEmbedding):
+                continue
+            if session is not None:
+                embed.detach_memfabric()
+            else:
+                embed.close_host_offload()
+        if session is not None:
+            session.close()
+            self._engram_offload_session = None
 
     def _get_engram_input_buffers(self):
         """Persistent capacity-sized lookup/mask buffers shared by all runs."""
@@ -1498,8 +1932,23 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         lookback_token_ids=None,
         engram_mask_ready_event=None,
     ):
+        layer_trace_call = _begin_engram_mf_layer_trace(self, positions)
         use_sequence_parallel = getattr(self, "use_sequence_parallel", False)
-        hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        elif (
+            self._engram_offload_session is not None
+            and memfabric_full_bypass_enabled()
+            and memfabric_bypass_fence_enabled()
+        ):
+            hook_name = "_vllm_ascend_forward_stage_hook"
+            setattr(self.embed_tokens, hook_name, self._engram_mf_vocab_embedding_stage_fence)
+            try:
+                hidden_states = self.embed_input_ids(input_ids)
+            finally:
+                delattr(self.embed_tokens, hook_name)
+        else:
+            hidden_states = self.embed_input_ids(input_ids)
         if engram_lookups is None:
             lookups, token_mask = self.prepare_engram(input_ids, positions, lookback_token_ids=lookback_token_ids)
         else:
@@ -1538,6 +1987,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         aux_hidden_states = []
         for layer in self.layers:
             last_layer = layer
+            _engram_mf_layer_trace(self, layer_trace_call, layer.layer_idx, "layer-begin")
             # DSpark consumes the residual stream entering its configured
             # target layers. The runner expresses checkpoint IDs as one-based.
             if layer.layer_idx + 1 in self.aux_hidden_state_layers:
@@ -1546,6 +1996,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)
             if layer.engram is not None and token_mask.numel():
+                _engram_mf_layer_trace(self, layer_trace_call, layer.layer_idx, "engram-begin")
                 # Without SP the earlier mask slices are views. Delay the wait
                 # until the first actual consumer so early layers can overlap
                 # hash/lookup production, rather than blocking at graph entry.
@@ -1572,7 +2023,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                     active_mask,
                     self.engram_rotation if self.engram_rotated else None,
                 )
+                _engram_mf_layer_trace(self, layer_trace_call, layer.layer_idx, "engram-returned")
+            _engram_mf_layer_trace(self, layer_trace_call, layer.layer_idx, "decoder-begin")
             hidden_states, pre_mix = layer(positions, hidden_states, pre_mix, None, input_ids=input_ids)
+            _engram_mf_layer_trace(self, layer_trace_call, layer.layer_idx, "decoder-returned")
         assert last_layer is not None, "Hyper-connection collapse requires at least one decoder layer"
         # MTP needs full HC states
         if self._mtp_hidden_buffer is not None:
@@ -1586,6 +2040,14 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         if use_sequence_parallel and self._mtp_hidden_buffer is None:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         hidden_states = self.norm(hidden_states)
+        if layer_trace_call is not None:
+            session = self._engram_offload_session
+            logger.warning(
+                "[Engram MF layer trace] FORWARD RETURNED device=%d mf_rank=%d call=%d",
+                session.topology.device_id,
+                session.topology.rank_id,
+                layer_trace_call,
+            )
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -1655,6 +2117,9 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
             cg_mode=cg_mode,
         )
 
+    def engram_memfabric_diagnostic_fence(self, stage: str) -> None:
+        self.model.engram_memfabric_diagnostic_fence(stage)
+
     def prepare_engram_graph_inputs(self, padded_tokens=None):
         return self.model.prepare_engram_graph_inputs(padded_tokens)
 
@@ -1663,6 +2128,9 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
 
     def retire_engram_lookups(self, *, reset_events=False):
         self.model.retire_engram_lookups(reset_events=reset_events)
+
+    def close_engram_offload(self) -> None:
+        self.model.close_engram_offload()
 
     def get_model_state_cls(self):
         """V2 runner states read token_lookback_depth and drive engram inputs."""

@@ -101,6 +101,11 @@ class EngramModelState(AscendModelState):
         depth = window.shape[1]
         from vllm_ascend.ops.triton.engram_lookback import _gather_lookback_kernel
 
+        self._engram_memfabric_diagnostic_fence(
+            "engram-state-before-lookback-gather "
+            f"grid={window.shape[0]} num_reqs={input_batch.num_reqs} "
+            f"idx_rows={input_batch.idx_mapping.shape[0]} depth={depth}"
+        )
         _gather_lookback_kernel[(window.shape[0],)](
             window,
             input_batch.idx_mapping,
@@ -111,15 +116,19 @@ class EngramModelState(AscendModelState):
             DEPTH=depth,
             BLOCK_DEPTH=triton.next_power_of_2(depth),
         )
+        self._engram_memfabric_diagnostic_fence("engram-state-after-lookback-gather")
         model_inputs["lookback_token_ids"] = window
         if self._engram_graph_inputs is not None and self._cg_mode == CUDAGraphMode.FULL:
             graph_inputs = self._engram_graph_inputs
             query = graph_inputs["engram_query_start_loc"]
             valid_tokens = 0 if input_batch.is_dummy else input_batch.num_tokens
             query.fill_(valid_tokens)
+            self._engram_memfabric_diagnostic_fence("engram-state-after-query-fill")
             if not input_batch.is_dummy:
                 query[: input_batch.num_reqs + 1].copy_(input_batch.query_start_loc[: input_batch.num_reqs + 1])
+                self._engram_memfabric_diagnostic_fence("engram-state-after-query-copy")
             graph_inputs["engram_valid_token_count"].fill_(valid_tokens)
+            self._engram_memfabric_diagnostic_fence("engram-state-after-valid-count-fill")
             model_inputs.update(graph_inputs)
             # FULL replay runs its own producers. No Python-side hash/lookup
             # and no ExternalEvent records may precede it on this route.
@@ -130,6 +139,7 @@ class EngramModelState(AscendModelState):
             # returned events are consumed inside the model. A FULL replay
             # ignores the returned dict but still needs its side effects:
             # persistent buffers filled and bucket events recorded.
+            self._engram_memfabric_diagnostic_fence("engram-state-before-model-prepare")
             model_inputs.update(
                 prepare_engram(
                     input_batch.input_ids,
@@ -141,6 +151,7 @@ class EngramModelState(AscendModelState):
                     force_dummy=input_batch.is_dummy,
                 )
             )
+            self._engram_memfabric_diagnostic_fence("engram-state-after-model-prepare")
         return model_inputs
 
     def prepare_engram_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:

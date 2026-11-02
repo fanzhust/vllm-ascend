@@ -267,6 +267,66 @@ and use the `main` branch with the matching vLLM revision recorded in
         used by this configuration. `enable_cpu_binding` pins worker processes to
         CPUs, while `enable_npugraph_ex` enables the enhanced ACL Graph path.
 
+#### Experimental MemFabric Engram Offload
+
+On A3, each complete Engram row (256 bytes of INT8 codes followed by 32 bytes
+of FP32 group scales) can be placed in a MemFabric SHARED Host DRAM pool. The
+lookup gathers the packed 288-byte row into an NPU staging buffer and
+dequantizes it there, so the persistent codes and scales do not occupy HBM.
+Install a compatible `memfabric_hybrid` wheel and first validate its
+`shared_engram_offload.py` example. Then add the following fields to the
+existing Engram configuration:
+
+```shell
+--engram-config '{"cpu_offload":true,"dp_shared_memory":true}' \
+--additional-config '{
+  "engram_offload_backend":"memfabric",
+  "engram_memfabric":{
+    "pool_scope":"tp_group",
+    "store_url_template":"tcp://127.0.0.1:{port}",
+    "store_port_base":8600,
+    "strict":true
+  }
+}'
+```
+
+Each complete TP replica joins one pool. Pool rank `k` owns the complete local
+head shard of TP rank `k`; it is not split again over DP ranks. The pool for DP
+replica `k` uses `store_port_base + k`; ensure that this port range is free.
+DP replicas use independent pools because MemFabric does not support a DP-axis
+SHARED pool. Consequently, DP2/TP8 creates two world-size-8 pools and stores
+two complete Engram copies in Host DRAM (about 384 GiB for a 192 GiB table,
+before slot alignment and padding).
+The first implementation requires PCP1, INT8 Engram storage with 256-wide
+code rows and eight FP32 group scales per row, and strict error handling. The
+MemFabric slot and huge-page reservation must account for the full 288-byte
+row pitch: each process reserves
+`ceil(rows_per_slot * 288 / 1 GiB) * 1 GiB`. It supports both model runner V1
+and V2 lifecycle cleanup. For a two-node DP2/TP8 trial, keep each complete TP8
+replica within one node and replace `127.0.0.1` with the pool rank-0 node's
+reachable address. Cross-node TP is not part of this validation topology.
+
+To avoid the peer-GVA/import path, set
+`VLLM_ASCEND_ENGRAM_MF_REPLICATED=1`. This fallback creates an independent
+SHARED world-size-1 pool in every worker and loads that TP rank's complete
+Engram table into it. Keep `dp_shared_memory=true`: it disables per-step DP row
+exchange, while the MemFabric storage itself is replicated. It uses roughly
+the same table payload as TP-group pools, but creates one native pool per TP
+rank and avoids peer mappings. One-rank
+pools use `store_port_base + local_device_id`, so that port range must be free.
+This is a runtime mode, not a diagnostic mode; do not combine it with
+`VLLM_ASCEND_ENGRAM_MF_DIAG_LOCAL` or
+`VLLM_ASCEND_ENGRAM_MF_DIAG_SHARED_SINGLE`.
+
+For control-flow diagnosis only,
+`VLLM_ASCEND_ENGRAM_MF_GVA_MODE=none` retains the model-side MemFabric
+session and NPU scratch buffers but skips native MemFabric initialization
+entirely. `VLLM_ASCEND_ENGRAM_MF_GVA_MODE=minimal` instead creates the normal
+multi-rank SHARED entity/import/mmap lifecycle with only a 1 GiB slot per rank,
+without allocating or registering the Engram table. Both modes require
+`VLLM_ASCEND_ENGRAM_MF_SKIP_LOAD=1` and
+`VLLM_ASCEND_ENGRAM_MF_BYPASS=full`; neither mode may be used for real lookup.
+
 ### 5.2 1P1D PD Disaggregated Deployment
 
 === "A3 series"
