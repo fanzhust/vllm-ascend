@@ -28,6 +28,14 @@ def test_memfabric_config_expands_supported_store_fields():
     assert config.store_url_template.format(port=8607, pool_index=7, tp_rank=7).endswith("8607/7/7")
 
 
+def test_memfabric_config_accepts_per_pool_store_templates():
+    config = EngramMemFabricConfig(
+        store_url_templates={0: "tcp://node-a:{port}", 1: "tcp://node-b:{port}"},
+    )
+    assert config.store_url_templates[0].format(port=8600, pool_index=0, tp_rank=0) == "tcp://node-a:8600"
+    assert config.store_url_templates[1].format(port=8601, pool_index=1, tp_rank=0) == "tcp://node-b:8601"
+
+
 def test_memfabric_pool_scope_is_tp_group_only():
     assert EngramMemFabricConfig().pool_scope == "tp_group"
     assert EngramMemFabricConfig(pool_scope="tp_group").pool_scope == "tp_group"

@@ -276,13 +276,21 @@ class AscendWarmupConfig:
 
 @config(config=ConfigDict(frozen=True))
 class EngramMemFabricConfig:
-    """MemFabric control-plane settings for Ascend Engram offload."""
+    """MemFabric control-plane settings for Ascend Engram offload.
+
+    A TP-scoped pool may span A3 nodes. In that case the pool's rank-0
+    machine must be reachable through ``store_url_template`` by every rank in
+    that pool. ``store_url_templates`` optionally overrides that template for
+    individual DP pool indices when their rank-0 workers live on different
+    machines.
+    """
 
     # MemFabric SHARED pools follow one complete TP replica. Each TP rank owns
     # one slot containing its complete local head shard; DP replicas use
     # independent pools because acc_offload does not support DP-axis pools.
     pool_scope: Literal["tp_group"] = "tp_group"
     store_url_template: str = "tcp://127.0.0.1:{port}"
+    store_url_templates: dict[int, str] = dataclasses.field(default_factory=dict)
     store_port_base: int = 8600
     strict: bool = True
 
@@ -292,16 +300,22 @@ class EngramMemFabricConfig:
             raise ValueError("engram_memfabric.strict=false is not supported; MemFabric failures must be explicit")
         if not 1 <= self.store_port_base <= 65535:
             raise ValueError("engram_memfabric.store_port_base must be between 1 and 65535")
-        try:
-            expanded = self.store_url_template.format(port=self.store_port_base, pool_index=0, tp_rank=0)
-        except (KeyError, ValueError) as exc:
-            raise ValueError(
-                "engram_memfabric.store_url_template supports only {port}, {pool_index}, and {tp_rank}"
-            ) from exc
-        if not expanded:
-            raise ValueError("engram_memfabric.store_url_template must not be empty")
-        if len(expanded.encode()) >= 64:
-            raise ValueError("expanded engram_memfabric.store_url_template must be shorter than 64 bytes")
+        templates = {"store_url_template": self.store_url_template}
+        for pool_index, template in self.store_url_templates.items():
+            if pool_index < 0:
+                raise ValueError("engram_memfabric.store_url_templates keys must be non-negative pool indices")
+            templates[f"store_url_templates[{pool_index}]"] = template
+        for field_name, template in templates.items():
+            try:
+                expanded = template.format(port=self.store_port_base, pool_index=0, tp_rank=0)
+            except (KeyError, ValueError) as exc:
+                raise ValueError(
+                    f"engram_memfabric.{field_name} supports only {{port}}, {{pool_index}}, and {{tp_rank}}"
+                ) from exc
+            if not expanded:
+                raise ValueError(f"engram_memfabric.{field_name} must not be empty")
+            if len(expanded.encode()) >= 64:
+                raise ValueError(f"expanded engram_memfabric.{field_name} must be shorter than 64 bytes")
         return self
 
 

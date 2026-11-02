@@ -360,7 +360,13 @@ class MemFabricEngramTopology:
             raise ValueError(
                 f"MemFabric Engram store port exceeds 65535: base={config.store_port_base}, store_slot={store_slot}"
             )
-        store_url = config.store_url_template.format(port=port, pool_index=store_slot, tp_rank=tp_rank)
+        # The default works when every TP pool's rank 0 is hosted by the same
+        # machine. A multi-DP deployment can place pool rank 0 on different
+        # hosts, so let configuration override the endpoint per DP pool while
+        # retaining the old single-template behaviour.
+        pool_templates = getattr(config, "store_url_templates", {}) or {}
+        store_url_template = pool_templates.get(pool_index, config.store_url_template)
+        store_url = store_url_template.format(port=port, pool_index=store_slot, tp_rank=tp_rank)
         if len(store_url.encode()) >= 64:
             raise ValueError(f"MemFabric Engram store URL must be shorter than 64 bytes: {store_url!r}")
         return cls(

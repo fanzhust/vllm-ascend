@@ -324,6 +324,51 @@ def test_memfabric_tp_pool_builds_one_production_pool_per_dp_replica(monkeypatch
     assert topology.store_url == "tcp://127.0.0.1:8601/1/3"
 
 
+def test_memfabric_tp_pool_uses_global_tp_ranks_for_cross_node_pool(monkeypatch):
+    tp_group = SimpleNamespace(rank_in_group=5, world_size=8, cpu_group=object())
+    dp_group = SimpleNamespace(rank_in_group=1, world_size=2)
+
+    def gather_pool_metadata(values, value, *, group):
+        assert group is tp_group.cpu_group
+        if isinstance(value, str):
+            values[:] = ["node-a"] * 4 + ["node-b"] * 4
+        else:
+            values[:] = [value] * tp_group.world_size
+
+    monkeypatch.setattr(memfabric_mod, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(memfabric_mod, "get_dp_group", lambda: dp_group)
+    monkeypatch.setattr(memfabric_mod, "get_tensor_model_parallel_rank", lambda: 5)
+    monkeypatch.setattr(memfabric_mod.socket, "gethostname", lambda: "node-b")
+    monkeypatch.setattr(memfabric_mod.dist, "all_gather_object", gather_pool_metadata)
+    monkeypatch.setattr(memfabric_mod.torch.npu, "current_device", lambda: 3)
+
+    topology = MemFabricEngramTopology.from_runtime(
+        SimpleNamespace(
+            pool_scope="tp_group",
+            store_port_base=8600,
+            store_url_template="tcp://pool-zero:{port}",
+            store_url_templates={1: "tcp://pool-one:{port}"},
+        )
+    )
+
+    # shared_engram_offload.py uses this exact rank scheme: rank 5 belongs to
+    # machine 1, local rank 1, in an 8-rank global TP pool.
+    assert (topology.rank_id, topology.world_size, topology.local_world_size) == (5, 8, 4)
+    assert topology.pool_index == 1
+    assert topology.store_url == "tcp://pool-one:8601"
+
+
+def test_memfabric_allows_cross_node_tp_but_host_uva_does_not(monkeypatch):
+    tp_group = SimpleNamespace(cpu_group=object())
+    monkeypatch.setattr(embedding_mod, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(embedding_mod, "get_engram_dp_group", lambda: None)
+    monkeypatch.setattr(embedding_mod, "in_the_same_node_as", lambda _: [True, False])
+
+    assert embedding_mod._validate_engram_node_placement(object()) is None
+    with pytest.raises(ValueError, match="TP ranks.*single node"):
+        embedding_mod._validate_engram_node_placement(None)
+
+
 def test_memfabric_topology_rejects_dp_axis_pool_scope():
     with pytest.raises(ValueError, match="only supports.*tp_group"):
         MemFabricEngramTopology.from_runtime(

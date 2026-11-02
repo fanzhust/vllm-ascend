@@ -284,6 +284,7 @@ existing Engram configuration:
   "engram_memfabric":{
     "pool_scope":"tp_group",
     "store_url_template":"tcp://127.0.0.1:{port}",
+    "store_url_templates":{},
     "store_port_base":8600,
     "strict":true
   }

@@ -156,6 +156,25 @@ def _begin_engram_mf_embedding_trace(table, gathered: torch.Tensor) -> int | Non
     return call
 
 
+def _validate_engram_node_placement(memfabric_table):
+    """Return the DP sharing group after validating its storage backend.
+
+    A normal host-UVA table relies on the host's shared-memory namespace and
+    therefore cannot cross a node boundary. A MemFabric table is different:
+    acc_offload SHARED establishes a whole-pool GVA for the TP group, so its
+    TP ranks may be distributed over A3 nodes.
+    """
+    tp_is_node_local = all(in_the_same_node_as(get_tp_group().cpu_group))
+    if not tp_is_node_local and memfabric_table is None:
+        raise ValueError("Ascend Engram requires the TP ranks of one replica to stay on a single node")
+    if not tp_is_node_local:
+        logger.info("MemFabric Engram TP pool spans multiple nodes; using its SHARED cross-node GVA")
+    group = get_engram_dp_group()
+    if memfabric_table is None and group is not None and not all(in_the_same_node_as(group.cpu_group)):
+        raise ValueError("Ascend Engram requires all DP replicas to share the same node and shared-memory namespace")
+    return group
+
+
 class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
     """TP(+EDP) head shard with BF16, INT8/FP32 or native MXFP8/E8M0."""
 
@@ -179,13 +198,7 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         self._memfabric_table = memfabric_table
         self.layer_hash_index = layer_hash_index
         self._shared_group = None
-        if not all(in_the_same_node_as(get_tp_group().cpu_group)):
-            raise ValueError("Ascend Engram requires the TP ranks of one replica to stay on a single node")
-        group = get_engram_dp_group()
-        if memfabric_table is None and group is not None and not all(in_the_same_node_as(group.cpu_group)):
-            raise ValueError(
-                "Ascend Engram requires all DP replicas to share the same node and shared-memory namespace"
-            )
+        group = _validate_engram_node_placement(memfabric_table)
         if dp_shared_memory:
             if group is None or group.world_size <= 1:
                 raise ValueError("dp_shared_memory needs a node-local sharing group with more than one rank")
