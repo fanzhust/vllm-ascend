@@ -841,6 +841,11 @@ class NPUWorker(WorkerBase):
             context = nullcontext()  # type: ignore
 
         with context, set_current_vllm_config(self.vllm_config):
+            from vllm_ascend.model_executor.warmup.engram_memfabric_warmup import (
+                warm_up_before_memfabric_engram,
+            )
+
+            warm_up_before_memfabric_engram(self.vllm_config, self.device)
             self.model_runner.load_model()
 
         if self.vllm_config.weight_transfer_config is not None:

@@ -451,6 +451,13 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.model_state.kvpp_runtime = self.kvpp
 
+    def shutdown(self) -> None:
+        model = getattr(self, "model", None)
+        close_engram = getattr(model, "close_engram_offload", None)
+        if callable(close_engram):
+            close_engram()
+        super().shutdown()
+
     def _register_sparse_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         """Bind host pools before the V2 KV connector registers its destinations."""
         manager = self.sparse_kv_offload_manager
@@ -650,6 +657,7 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
         assert num_tokens > 0
 
+
         req_ids = batch_req_state.req_ids
 
         self._update_seq_lens_cpu(scheduler_output, req_ids)
@@ -783,6 +791,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.req_states.prefill_len.gpu,
                 self.req_states.num_computed_tokens.gpu,
             )
+
 
         # Prepare positions and seq_lens.
         prepare_pos_seq_lens(

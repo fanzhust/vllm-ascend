@@ -89,9 +89,11 @@ from .engram.common import load_engram_rotation_block
 from .engram.embedding import (
     AscendParallelEngramEmbedding,
     engram_storage_dtype,
+    memfabric_checkpoint_identity,
     preflight_engram_checkpoint,
 )
 from .engram.layer import AscendEngram
+from .engram.memfabric import MemFabricEngramSession
 from .engram.parallel import gather_engram_hashes, resolve_dp_shared_memory
 from .indexer import DeepseekV41Indexer
 
@@ -930,10 +932,64 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
 
         config = normalize_deepseek_v41_config(vllm_config.model_config.hf_config)
         quant_config = vllm_config.quant_config
+        ascend_config = get_ascend_config()
         self.config = config
         self.has_engram = _engram_enabled_for_runtime(config, vllm_config)
         self.device = current_platform.device_type
         self.use_sequence_parallel_moe = vllm_config.parallel_config.use_sequence_parallel_moe
+
+        # Reserve and map the MemFabric GVA before constructing any model
+        # parameters or long-lived NPU buffers.  SHARED initialization imports
+        # peer slices into the device address space; doing that after
+        # make_layers() leaves HYBM to modify an already-populated torch_npu
+        # address space and is observably unsafe for a world-size > 1 pool.
+        self.engram_root = vllm_config.model_config.model
+        self.engram_weight_root = self.engram_root
+        cpu_offload = engram_cpu_offload(vllm_config)
+        self.engram_dp_shared_memory = resolve_dp_shared_memory(
+            bool(vllm_config.engram_config and vllm_config.engram_config.dp_shared_memory)
+        )
+        self._engram_offload_session = None
+        self._engram_max_tokens = max(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+        )
+        self.engram_layout = EngramLayout.from_config(config) if self.has_engram else None
+        prepared = []
+        if self.engram_layout is not None:
+            mf_config = ascend_config.engram_memfabric
+            dummy_weights = vllm_config.load_config.load_format == "dummy"
+            if mf_config is None and not dummy_weights:
+                preflight_engram_checkpoint(self.engram_weight_root, config.engram_layer_ids)
+            native_mxfp8 = get_current_hardware_profile().supports(HardwareCapability.ENGRAM_MXFP8)
+            for slot, (layer_id, rows) in enumerate(zip(config.engram_layer_ids, config.engram_num_embeddings)):
+                head_sizes = tuple(size for order in self.engram_layout.primes[slot] for size in order)
+                if mf_config is not None:
+                    storage_dtype = torch.int8
+                elif not dummy_weights:
+                    storage_dtype = engram_storage_dtype(self.engram_weight_root, layer_id)
+                    if storage_dtype == torch.float8_e4m3fn and not native_mxfp8:
+                        storage_dtype = torch.int8
+                elif vllm_config.quant_config is None:
+                    storage_dtype = torch.bfloat16
+                else:
+                    storage_dtype = torch.float8_e4m3fn if native_mxfp8 else torch.int8
+                prepared.append((slot, layer_id, rows, head_sizes, storage_dtype))
+
+            if mf_config is not None:
+                self.engram_dp_shared_memory = True  # Engram lookup never exchanges token rows over DP.
+                self._engram_offload_session = MemFabricEngramSession(
+                    [(slot, heads) for slot, _, _, heads, _ in prepared],
+                    self._engram_max_tokens,
+                    mf_config,
+                    vllm_config.parallel_config,
+                    lambda: memfabric_checkpoint_identity(
+                        self.engram_weight_root,
+                        [(layer, rows, heads) for _, layer, rows, heads, _ in prepared],
+                        vllm_config.model_config.revision,
+                        dummy=dummy_weights,
+                    ),
+                )
 
         self.vocab_size = config.vocab_size
         if hasattr(config, "index_topk"):
@@ -965,6 +1021,39 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             lambda prefix: self.decoder_layer_cls(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
             prefix=f"{prefix}.layers",
         )
+
+        if self.engram_layout is not None:
+            session = self._engram_offload_session
+            load_error = None
+            try:
+                for slot, layer_id, rows, head_sizes, storage_dtype in prepared:
+                    table = session.table(slot) if session is not None else None
+                    embed = AscendParallelEngramEmbedding(
+                        rows,
+                        config.engram_head_dim,
+                        head_sizes,
+                        slot,
+                        storage_dtype=storage_dtype,
+                        cpu_offload=cpu_offload,
+                        dp_shared_memory=self.engram_dp_shared_memory,
+                        memfabric_table=table,
+                    )
+                    key = f"layers.{layer_id}.engram.embed.weight"
+                    embed.bind_checkpoint(self.engram_weight_root, key)
+                    self.layers[layer_id].engram.embed_tokens = embed
+                    if session is not None and not dummy_weights:
+                        embed.load_checkpoint(self.engram_weight_root, key)
+            except Exception as exc:
+                if session is None:
+                    raise
+                load_error = f"{type(exc).__name__}: {exc}"
+            if session is not None:
+                try:
+                    session.finish_loading(load_error)
+                except BaseException:
+                    session.close(synchronize_group=False)
+                    self._engram_offload_session = None
+                    raise
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1014,48 +1103,6 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         for layer in self.layers:
             if isinstance(layer, DeepseekV41DecoderLayer):
                 layer.self_attn.shared_state = self.shared_attention_state
-        self.engram_root = vllm_config.model_config.model
-        config = self.config
-        self.engram_weight_root = self.engram_root
-        # Detect each table's checkpoint dtype independently of dense weights.
-        # Host placement remains controlled by vLLM's EngramConfig.
-        cpu_offload = engram_cpu_offload(vllm_config)
-        self.engram_dp_shared_memory = resolve_dp_shared_memory(
-            bool(vllm_config.engram_config and vllm_config.engram_config.dp_shared_memory)
-        )
-        self.engram_layout = EngramLayout.from_config(config) if self.has_engram else None
-        if self.engram_layout is not None:
-            # Complete head buckets per rank, laid out over TP and the
-            # node-local EDP group (upstream's, not one built from EP hosts).
-            # Fail on an unreadable checkpoint before the first table exists:
-            # the allocation below is per-rank 24-51 GiB, and discovering a
-            # missing index/key during weight iteration would mean paying for
-            # it first.  `dummy` reads no checkpoint at all.
-            if vllm_config.load_config.load_format != "dummy":
-                preflight_engram_checkpoint(
-                    self.engram_weight_root, config.engram_layer_ids, AscendParallelEngramEmbedding
-                )
-            native_mxfp8 = get_current_hardware_profile().supports(HardwareCapability.ENGRAM_MXFP8)
-            for slot, (layer_id, rows) in enumerate(zip(config.engram_layer_ids, config.engram_num_embeddings)):
-                head_sizes = tuple(size for order in self.engram_layout.primes[slot] for size in order)
-                storage_dtype = torch.bfloat16 if vllm_config.quant_config is None else torch.int8
-                if vllm_config.load_config.load_format != "dummy":
-                    storage_dtype = engram_storage_dtype(self.engram_weight_root, layer_id)
-                    if storage_dtype == torch.float8_e4m3fn and not native_mxfp8:
-                        storage_dtype = torch.int8
-                elif native_mxfp8 and vllm_config.quant_config is not None:
-                    storage_dtype = torch.float8_e4m3fn
-                embed = AscendParallelEngramEmbedding(
-                    rows,
-                    config.engram_head_dim,
-                    head_sizes,
-                    slot,
-                    storage_dtype=storage_dtype,
-                    cpu_offload=cpu_offload,
-                    dp_shared_memory=self.engram_dp_shared_memory,
-                )
-                embed.bind_checkpoint(self.engram_weight_root, f"layers.{layer_id}.engram.embed.weight")
-                self.layers[layer_id].engram.embed_tokens = embed
         self.engram_hash = None
         self._engram_input_buffers = None
         # ExternalEvent pairs for FULL graph capture. V1 keys by the forward
@@ -1065,11 +1112,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         self._engram_prepare_stream = None
         self._engram_capture_stream = None
         self._engram_capture_events = None
-        self._engram_overlap_enabled = get_ascend_config().multistream_engram_overlap
-        self._engram_max_tokens = max(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            vllm_config.compilation_config.max_cudagraph_capture_size or 0,
-        )
+        self._engram_overlap_enabled = ascend_config.multistream_engram_overlap
         rotation_path = get_rotation_path(vllm_config)
         self.engram_rotated = rotation_path is not None
         self.register_buffer("engram_rotation", torch.eye(32), persistent=False)
@@ -1174,13 +1217,14 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             publish_mask()
             if lookback_token_ids is None:
                 lookback_token_ids = input_ids.new_full((query_start_loc.numel() - 1, hash_state.lookback_depth), -1)
+            lookback_dead = engram_dead_mask(lookback_token_ids, image_token_id, image_pad_token_id)
             hashes = hash_state(
                 input_ids,
                 positions,
                 query_start_loc,
                 dead,
                 lookback_token_ids,
-                engram_dead_mask(lookback_token_ids, image_token_id, image_pad_token_id),
+                lookback_dead,
                 slot_mapping,
                 block_table,
             )
@@ -1197,17 +1241,16 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             # One DP gather feeds every layer sharing the split table.
             gathered = gather_engram_hashes(hashes, dp_shared_memory=self.engram_dp_shared_memory)
             for slot, (layer_id, table) in enumerate(zip(config.engram_layer_ids, tables)):
+                layer_gathered = gathered[:, slot]
                 direct = output_buffers is not None and table.dp_size == 1 and table.tp_size == 1
                 if direct:
                     target = output_buffers[layer_id]
                     count = hashes.shape[0]
-                    table.lookup(
-                        gathered[:, slot].contiguous(), target[:count].view(count, table.n_hash_cols, table.dim)
-                    )
+                    table.lookup(layer_gathered, target[:count].view(count, table.n_hash_cols, table.dim))
                     target[count:output_tokens].zero_()
                     lookups[layer_id] = target
                 else:
-                    values = table.embed_gathered(gathered[:, slot], hashes.shape[0]).flatten(1)
+                    values = table.embed_gathered(layer_gathered, hashes.shape[0]).flatten(1)
                     if output_buffers is None:
                         lookups[layer_id] = values
                     else:
@@ -1321,6 +1364,24 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 for mask_ready, events in self._engram_graph_events.values():
                     for event in (mask_ready, *events.values()):
                         event.reset(main)
+
+    def close_engram_offload(self) -> None:
+        """Deterministically release model-owned Engram host resources."""
+        if not self.has_engram:
+            return
+        session = self._engram_offload_session
+        for layer_id in self.config.engram_layer_ids:
+            layer = self.layers[layer_id]
+            embed = getattr(getattr(layer, "engram", None), "embed_tokens", None)
+            if not isinstance(embed, AscendParallelEngramEmbedding):
+                continue
+            if session is not None:
+                embed.detach_memfabric()
+            else:
+                embed.close_host_offload()
+        if session is not None:
+            session.close()
+            self._engram_offload_session = None
 
     def _get_engram_input_buffers(self):
         """Persistent capacity-sized lookup/mask buffers shared by all runs."""
@@ -1499,7 +1560,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         engram_mask_ready_event=None,
     ):
         use_sequence_parallel = getattr(self, "use_sequence_parallel", False)
-        hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_input_ids(input_ids)
         if engram_lookups is None:
             lookups, token_mask = self.prepare_engram(input_ids, positions, lookback_token_ids=lookback_token_ids)
         else:
@@ -1663,6 +1727,9 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
 
     def retire_engram_lookups(self, *, reset_events=False):
         self.model.retire_engram_lookups(reset_events=reset_events)
+
+    def close_engram_offload(self) -> None:
+        self.model.close_engram_offload()
 
     def get_model_state_cls(self):
         """V2 runner states read token_lookback_depth and drive engram inputs."""

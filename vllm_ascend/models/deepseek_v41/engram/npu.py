@@ -21,11 +21,11 @@ from vllm.logger import logger
 from vllm_ascend.device.device_op import DeviceOperator
 
 SCALE_GROUP = 32
+MEMFABRIC_MAP_BLOCK = 256
 # A 384M row table overflows the 32 bit offset arithmetic a single Triton tile
 # can express, so the device address of every group of rows is published
 # separately.
 CHUNK_ROWS = 1 << 22
-
 
 def engram_cpu_offload(vllm_config) -> bool:
     """Whether the Engram table is offloaded to host memory (UVA lookup).
@@ -246,6 +246,73 @@ def gather_dequantize_host_uva(
         num_warps=4,
     )
     return output
+
+
+def gather_dequantize_memfabric(
+    table,
+    ids: torch.Tensor,
+    *,
+    head_start: int,
+    local_heads: int,
+    pad_heads: int,
+    output: torch.Tensor,
+    vocab_start: int,
+    vocab_end: int,
+) -> torch.Tensor:
+    """Gather packed 288-byte INT8/FP32 rows and dequantize on the NPU."""
+    from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+
+    rows = ids.shape[0] * local_heads
+    if rows == 0:
+        return output
+    if rows > table.global_ids.numel():
+        raise ValueError(
+            f"MemFabric Engram lookup needs {rows} rows, but its stable scratch holds {table.global_ids.numel()}"
+        )
+    if not table.pool.ready:
+        raise RuntimeError("MemFabric Engram lookup started before the pool was ready")
+    init_device_properties_triton()
+    from vllm_ascend.ops.triton.engram_lookup import (
+        _engram_memfabric_dequant_kernel,
+        _engram_memfabric_map_ids_kernel,
+    )
+
+    _engram_memfabric_map_ids_kernel[((rows + MEMFABRIC_MAP_BLOCK - 1) // MEMFABRIC_MAP_BLOCK,)](
+        ids, table.global_ids, table.count, rows, vocab_start, vocab_end, ids.stride(0),
+        HEAD_START=head_start,
+        LOCAL_HEADS=local_heads,
+        POOL_ROW_BASE=table.segment.pool_row_base,
+        OWNER_ROWS=table.owner_rows,
+        EXTRA_OWNERS=table.extra_owners,
+        LAYER_BASE=table.segment.layer_base,
+        ROWS_PER_SLOT=table.rows_per_slot,
+        SAFE_ENTRY_ID=table.safe_entry_id,
+        BLOCK=MEMFABRIC_MAP_BLOCK,
+        num_warps=1,
+    )
+    if rc := _submit_memfabric_entry_gather(table):
+        raise RuntimeError(f"MemFabric Engram entry_gather failed: rc={rc}")
+    _engram_memfabric_dequant_kernel[(rows,)](
+        table.staging, table.staging_fp32, ids, output, rows, vocab_start, vocab_end, ids.stride(0),
+        ENTRY_BYTES=table.staging.shape[1],
+        CODE_BYTES=table.code_bytes,
+        GROUP=SCALE_GROUP,
+        HEAD_START=head_start,
+        LOCAL_HEADS=local_heads,
+        PAD_HEADS=pad_heads,
+        num_warps=4,
+    )
+    return output
+
+
+def _submit_memfabric_entry_gather(table) -> int:
+    """Submit through MemFabric's public tensor-oriented Python API."""
+    return table.pool.offload.entry_gather(
+        table.staging,
+        table.global_ids,
+        table.count,
+        table.staging.device,
+    )
 
 
 class SharedUvaBuffer:

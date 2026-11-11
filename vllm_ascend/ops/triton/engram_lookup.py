@@ -121,3 +121,91 @@ def _engram_host_uva_gather_dequant_kernel(
             output + (token * PAD_HEADS + head_local) * WIDTH + col,
             tl.where(owned, result, tl.zeros_like(result)),
         )
+
+
+@triton.jit
+def _engram_memfabric_map_ids_kernel(
+    ids,
+    global_ids,
+    count,
+    rows,
+    vocab_start,
+    vocab_end,
+    ids_stride_t,
+    HEAD_START: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    POOL_ROW_BASE: tl.constexpr,
+    OWNER_ROWS: tl.constexpr,
+    EXTRA_OWNERS: tl.constexpr,
+    LAYER_BASE: tl.constexpr,
+    ROWS_PER_SLOT: tl.constexpr,
+    SAFE_ENTRY_ID: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = row < rows
+    token = row // LOCAL_HEADS
+    head_local = row % LOCAL_HEADS
+    source_row = tl.load(
+        ids + token * ids_stride_t + HEAD_START + head_local,
+        mask=mask,
+        other=0,
+    ).to(tl.int64)
+    valid = mask & (source_row >= vocab_start) & (source_row < vocab_end)
+    pool_row = tl.where(valid, source_row - POOL_ROW_BASE, 0).to(tl.uint32)
+    long_owner_span: tl.constexpr = (OWNER_ROWS + 1) * EXTRA_OWNERS
+    if EXTRA_OWNERS:
+        tail = tl.maximum(pool_row, long_owner_span) - long_owner_span
+        is_long = pool_row < long_owner_span
+        owner = tl.where(is_long, pool_row // (OWNER_ROWS + 1), EXTRA_OWNERS + tail // OWNER_ROWS)
+        local_row = tl.where(is_long, pool_row % (OWNER_ROWS + 1), tail % OWNER_ROWS)
+    else:
+        owner = pool_row // OWNER_ROWS
+        local_row = pool_row % OWNER_ROWS
+    entry_id = owner.to(tl.int64) * ROWS_PER_SLOT + LAYER_BASE + local_row
+    # Use this worker's first backed row for invalid IDs. The dequant kernel
+    # masks their outputs, and padding does not generate remote DRAM reads.
+    tl.store(global_ids + row, tl.where(valid, entry_id, SAFE_ENTRY_ID), mask=mask)
+    if pid == 0:
+        tl.store(count, rows)
+
+
+@triton.jit
+def _engram_memfabric_dequant_kernel(
+    staging,
+    staging_fp32,
+    ids,
+    output,
+    rows,
+    vocab_start,
+    vocab_end,
+    ids_stride_t,
+    ENTRY_BYTES: tl.constexpr,
+    CODE_BYTES: tl.constexpr,
+    GROUP: tl.constexpr,
+    HEAD_START: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    PAD_HEADS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if row < rows:
+        token = row // LOCAL_HEADS
+        head_local = row % LOCAL_HEADS
+        source_row = tl.load(ids + token * ids_stride_t + HEAD_START + head_local).to(tl.int64)
+        owned = (source_row >= vocab_start) & (source_row < vocab_end)
+        col = tl.arange(0, CODE_BYTES)
+        entry = staging + row * ENTRY_BYTES
+        codes = tl.load(entry + col).to(tl.float32)
+        # staging_fp32 aliases the packed staging storage. Supplying its typed
+        # base from PyTorch avoids an int8-pointer -> FP32-pointer cast, which
+        # Ascend Triton rejects even though both pointers have the same width.
+        scale_base = staging_fp32 + row * (ENTRY_BYTES // 4) + CODE_BYTES // 4
+        groups = tl.arange(0, CODE_BYTES // GROUP)
+        scale = tl.load(scale_base + groups)
+        value = tl.reshape(codes, (CODE_BYTES // GROUP, GROUP)) * scale[:, None]
+        result = tl.reshape(value, (CODE_BYTES,)).to(tl.bfloat16)
+        tl.store(
+            output + (token * PAD_HEADS + head_local) * CODE_BYTES + col,
+            tl.where(owned, result, tl.zeros_like(result)),
+        )

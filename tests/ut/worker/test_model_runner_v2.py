@@ -1175,6 +1175,18 @@ def test_copy_num_computed_tokens_to_cpu_records_event():
     runner.num_computed_tokens_event.record.assert_called_once_with()
 
 
+def test_shutdown_closes_engram_before_parent_cleanup():
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.model = MagicMock()
+
+    with patch.object(GPUModelRunner, "shutdown") as parent:
+        runner.shutdown()
+
+    runner.model.close_engram_offload.assert_called_once_with()
+    parent.assert_called_once_with()
+
+
+
 @pytest.mark.parametrize("model_type", ["deepseek_v41", "other_model"])
 @pytest.mark.parametrize("speculative", [False, True])
 @pytest.mark.parametrize("pp_sync", [False, True])

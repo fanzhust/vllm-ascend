@@ -267,6 +267,55 @@ and use the `main` branch with the matching vLLM revision recorded in
         used by this configuration. `enable_cpu_binding` pins worker processes to
         CPUs, while `enable_npugraph_ex` enables the enhanced ACL Graph path.
 
+#### MemFabric Engram Offload on A3
+
+MemFabric SHARED pools hold packed INT8/FP32 Engram rows (288 bytes each).
+Each worker owns one row range in its head pool. The lookup uses
+`entry_gather` to stage rows in local NPU memory before dequantization.
+All pools together hold one logical copy of the table.
+
+Use a `memfabric_hybrid` wheel with A3 multi-node SHARED, `local_world_size`,
+`register_entry_table`, and `entry_gather`. Run the MemFabric
+`shared_engram_offload.py` example on the intended nodes to verify the fabric.
+For the A3 trial, use the 1.5.0 wheel from the MemFabric build under test.
+When installing this source tree into that prepared environment, use
+`pip install -e . --no-deps` so dependency installation does not replace it.
+
+For single-node DP2/TP8, set `--engram-config '{"cpu_offload":true}'` and merge
+the following object into `--additional-config`:
+
+```json
+{"engram_memfabric":{"store_url":"tcp://127.0.0.1:8600","control_port":8599}}
+```
+
+This launches eight two-rank pools using ports 8600 through 8607, plus the
+vLLM-Ascend control port 8599. For two-node PD with P=DP4/TP4 and D=DP8/TP2,
+use the following `engram_memfabric` object on both nodes, changing
+`node_rank` to 1 on D:
+
+```json
+{"store_url":"tcp://10.0.0.10:8600","control_port":8599,"num_nodes":2,"node_rank":0}
+```
+
+Replace the host with a reachable address on node 0. The workers select
+two pools (ports 8600 and 8601), each with 16 members and eight per node.
+For three DP4/TP4 P nodes and one DP8/TP2 D node, use `num_nodes: 4` and
+a unique `node_rank` from 0 to 3. Each pool then has 32 members.
+
+Use the same immutable checkpoint on all participants, PP1 and PCP1.
+The AICPU metadata warmup runs before the pool maps peer memory. Workers
+wait for checkpoint publication before profiling or serving. Reserve
+the full range of store ports and a separate control port on node 0.
+Actual host allocation is rounded up to 1 GiB per rank per pool.
+
+Operate the workers as one fixed-membership deployment. Stop admitting
+requests and initiate shutdown on all participating instances together.
+Set the existing `VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS` on each host to
+allow the workers to drain before the executor terminates them, for example
+`180` seconds. If any member is lost, stop the entire deployment and restart
+it together. A worker using MemFabric Engram cannot use sparse KV offload
+through the same process-wide `acc_offload` session.
+
 ### 5.2 1P1D PD Disaggregated Deployment
 
 === "A3 series"

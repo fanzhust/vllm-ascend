@@ -432,7 +432,8 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         # Standard vocabulary parallelism keeps identical token rows on every
         # rank. Sum the vocabulary-shard contributions without scattering the
         # token dimension; the first decoder layer expects the complete sequence.
-        return torch.ops.vllm.all_reduce(output_parallel, reduce_group.unique_name)
+        output = torch.ops.vllm.all_reduce(output_parallel, reduce_group.unique_name)
+        return output
 
 
 class AscendParallelLMHead(ParallelLMHead):

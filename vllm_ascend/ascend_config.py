@@ -22,6 +22,7 @@ import math
 import os
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from urllib.parse import urlsplit
 
 from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
 from pydantic_core import ArgsKwargs
@@ -274,6 +275,31 @@ class AscendWarmupConfig:
     enable_early_nz_warmup: bool = False
 
 
+@config(config=ConfigDict(frozen=True))
+class EngramMemFabricConfig:
+    """Endpoints and machine coordinates for a MemFabric Engram deployment."""
+
+    store_url: str
+    control_port: int
+    num_nodes: int = 1
+    node_rank: int = 0
+
+    @model_validator(mode="after")
+    def _validate(self):
+        endpoint = urlsplit(self.store_url)
+        if (
+            endpoint.scheme != "tcp" or not endpoint.hostname or endpoint.port is None
+            or endpoint.path or endpoint.query or endpoint.fragment or endpoint.username is not None
+            or not 1 <= endpoint.port <= 65535 or len(self.store_url.encode()) >= 64
+        ):
+            raise ValueError("engram_memfabric.store_url must be tcp://HOST:PORT and shorter than 64 bytes")
+        if not 1 <= self.control_port <= 65535 or self.control_port == endpoint.port:
+            raise ValueError("engram_memfabric.control_port must be a valid TCP port different from the store port")
+        if not 0 <= self.node_rank < self.num_nodes:
+            raise ValueError("engram_memfabric.node_rank must be in [0, num_nodes)")
+        return self
+
+
 @config
 class EplbConfig:
     """Configuration Object for ``additional_config["eplb_config"]``.
@@ -425,6 +451,7 @@ class AscendConfig:
             "enable_cpu_binding": true,
             "multistream_dsv4_dsa_overlap": true,
             "multistream_engram_overlap": true,
+            "engram_memfabric": null,
             "enable_prefill_mc2": false,
             "multistream_overlap_shared_expert": false,
             "enable_kv_nz": false,
@@ -571,9 +598,11 @@ class AscendConfig:
     # FULL graphs wait on descriptor-specific external events at consumers.
     # Default to overlap on A5 only; explicit settings override this policy.
     multistream_engram_overlap: bool = dataclasses.field(
-        default_factory=lambda: get_current_hardware_profile().device_adaptor_family
-        == DeviceAdaptorFamily.FP8_OPTIMIZED
+        default_factory=lambda: (
+            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+        )
     )
+    engram_memfabric: EngramMemFabricConfig | None = None
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
@@ -693,6 +722,15 @@ class AscendConfig:
             # DP-dummy ranks have no hash work in MRV2. Share host tables so
             # replicas do not require matching embedding collectives each step.
             engram_config.dp_shared_memory = True
+        if self.engram_memfabric is not None:
+            if engram_config is None or not engram_config.cpu_offload:
+                raise ValueError("additional_config.engram_memfabric requires --engram-config with cpu_offload=true")
+            if vc.parallel_config.pipeline_parallel_size != 1 or vc.parallel_config.prefill_context_parallel_size != 1:
+                raise ValueError("MemFabric Engram requires pipeline and prefill context parallel sizes of 1")
+            if not get_current_hardware_profile().supports(HardwareCapability.ENGRAM_MEMFABRIC):
+                raise ValueError("MemFabric Engram offload currently supports only Ascend A3")
+            if self.sparse_kv_offload_config.enabled:
+                raise ValueError("MemFabric Engram and sparse KV offload cannot share the acc_offload session")
         if (
             self.enable_force_eplb
             and self.eplb_config.dynamic_eplb
