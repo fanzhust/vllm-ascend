@@ -110,6 +110,44 @@ def test_memfabric_entry_contains_codes_and_fp32_scales():
     assert ENTRY_BYTES == 288
 
 
+def _mock_worker_world(monkeypatch, node_ranks, worker_rank, tp):
+    world = SimpleNamespace(world_size=len(node_ranks), rank_in_group=worker_rank, cpu_group=object())
+
+    def gather(output, node_rank, *, group):
+        assert group is world.cpu_group
+        assert node_rank == node_ranks[worker_rank]
+        output[:] = node_ranks
+
+    monkeypatch.setattr(memfabric_mod, "get_world_group", lambda: world)
+    monkeypatch.setattr(memfabric_mod, "get_tensor_model_parallel_rank", lambda: worker_rank % tp)
+    monkeypatch.setattr(memfabric_mod.dist, "all_gather_object", gather)
+
+
+@pytest.mark.parametrize(
+    "node_ranks,worker_rank,local_size,local_rank",
+    [
+        ([0] * 16, 13, 16, 13),  # One engine launches all DP replicas on one machine.
+        ([0] * 8 + [1] * 8, 13, 8, 5),  # Offline DP spans two machines.
+        ([0] * 4 + [1] * 4 + [0] * 4 + [1] * 4, 13, 8, 5),  # Both TP groups span two machines.
+    ],
+)
+def test_memfabric_control_uses_worker_placement(monkeypatch, node_ranks, worker_rank, local_size, local_rank):
+    _mock_worker_world(monkeypatch, node_ranks, worker_rank, tp=8)
+    store = MagicMock()
+    monkeypatch.setattr(memfabric_mod.dist, "TCPStore", store)
+    node_rank = node_ranks[worker_rank]
+    control = memfabric_mod.EngramPoolControl(
+        SimpleNamespace(
+            store_url="tcp://127.0.0.1:8600", control_port=8599, num_nodes=len(set(node_ranks)), node_rank=node_rank
+        ),
+        SimpleNamespace(tensor_parallel_size=8, data_parallel_size=2, nnodes=1),
+    )
+
+    assert (control.local_size, control.local_rank, control.world_size) == (local_size, local_rank, 16)
+    assert control.rank == node_rank * local_size + local_rank
+    assert store.call_args.kwargs["is_master"] is False
+
+
 def test_memfabric_control_rendezvous_waits_for_late_worker_registration(monkeypatch):
     timeout = timedelta(seconds=10)
     monkeypatch.setattr(memfabric_mod, "_STARTUP_TIMEOUT", timeout)
@@ -117,10 +155,10 @@ def test_memfabric_control_rendezvous_waits_for_late_worker_registration(monkeyp
         listener.bind(("127.0.0.1", 0))
         control_port = listener.getsockname()[1]
     controls = []
-    for node, tp, dp in ((0, 2, 1), (1, 1, 2)):
+    for node, tp, dp in ((0, 4, 4), (1, 2, 8)):
         for dp_rank in range(dp):
             for tp_rank in range(tp):
-                monkeypatch.setattr(memfabric_mod, "get_tensor_model_parallel_rank", lambda rank=tp_rank: rank)
+                _mock_worker_world(monkeypatch, [node] * (dp * tp), dp_rank * tp + tp_rank, tp)
                 controls.append(
                     memfabric_mod.EngramPoolControl(
                         SimpleNamespace(
@@ -131,22 +169,25 @@ def test_memfabric_control_rendezvous_waits_for_late_worker_registration(monkeyp
                             local_world_size=tp,
                             data_parallel_size_local=1,
                             data_parallel_size=dp,
-                            data_parallel_rank_local=dp_rank,
+                            data_parallel_rank_local=0,
+                            data_parallel_index=dp_rank,
                             nnodes=1,
-                            data_parallel_external_lb=False,
+                            data_parallel_external_lb=True,
                             data_parallel_hybrid_lb=False,
                         ),
                     )
                 )
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=len(controls)) as executor:
         first = executor.submit(controls[0].plan, "checkpoint", None)
         controls[1].store.wait(["worker/0/0"], timeout)
         others = [executor.submit(control.plan, "checkpoint", None) for control in controls[1:]]
-        for rank, result in enumerate([first, *others]):
+        for worker, result in zip(controls, [first, *others], strict=True):
             num_pools, membership = result.result(timeout=timeout.total_seconds())
-            assert num_pools == 1
-            assert membership.rank_id == rank
-            assert membership.local_world_size == 2
+            assert num_pools == 2
+            assert len(membership.members) == 16
+            assert membership.local_world_size == 8
+            assert membership.members[membership.rank_id] == worker.rank
+            assert membership.rank_id // 8 == worker.node_rank
 
 
 def test_ordered_warmup_materializes_hccl_before_aicpu(monkeypatch):

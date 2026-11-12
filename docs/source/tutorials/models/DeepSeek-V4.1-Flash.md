@@ -299,6 +299,10 @@ use the following `engram_memfabric` object on both nodes, changing
 
 Replace the host with a reachable address on node 0. The workers select
 two pools (ports 8600 and 8601), each with 16 members and eight per node.
+With the Section 5.2 launcher, pass the same Engram configuration to every
+DP process on a machine. Keep each role's existing vLLM DP arguments.
+Engram derives the machine's worker count from the vLLM worker group, so
+the launcher can continue to start one API process per DP rank.
 For three DP4/TP4 P nodes and one DP8/TP2 D node, use `num_nodes: 4` and
 a unique `node_rank` from 0 to 3. Each pool then has 32 members.
 

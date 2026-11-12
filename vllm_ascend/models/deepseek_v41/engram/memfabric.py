@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import torch
 import torch.distributed as dist
-from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.distributed import get_tensor_model_parallel_rank, get_world_group
 from vllm.logger import logger
 
 from .memfabric_layout import (
@@ -37,27 +37,25 @@ class EngramPoolControl:
     """Deployment-wide CPU rendezvous shared by independent P/D engines."""
 
     def __init__(self, config, parallel):
-        tp = parallel.tensor_parallel_size
-        tp_rank = get_tensor_model_parallel_rank()
-        local_tp = parallel.local_world_size
-        local_dp = parallel.data_parallel_size_local
-        # Offline SPMD reads the DP size from VLLM_DP_SIZE after the engine
-        # args have already defaulted data_parallel_size_local to one.
-        if parallel.nnodes == 1 and not (parallel.data_parallel_external_lb or parallel.data_parallel_hybrid_lb):
-            local_dp = parallel.data_parallel_size
-        dp_rank = parallel.data_parallel_rank_local
-        if dp_rank is None:
-            dp_rank = parallel.data_parallel_index
-        if not 0 <= dp_rank < local_dp or local_tp < 1 or tp % local_tp:
-            raise ValueError("Cannot derive a machine-local Engram worker rank from vLLM parallel configuration")
         if config.num_nodes < parallel.nnodes:
             raise ValueError("engram_memfabric.num_nodes must cover all vLLM worker machines")
-        local_rank = dp_rank * local_tp + tp_rank % local_tp
-        self.local_size = local_tp * local_dp
+        self.tp = parallel.tensor_parallel_size
+        self.tp_rank = get_tensor_model_parallel_rank()
+        world = get_world_group()
+        if world.world_size != parallel.data_parallel_size * self.tp:
+            raise ValueError("MemFabric Engram requires a vLLM world group containing the instance's DP × TP workers")
+        # The world group covers this vLLM instance, including DP ranks
+        # started by separate launchers. Each P/D instance discovers its own
+        # placement before joining the shared MemFabric control store.
+        node_ranks = [-1] * world.world_size
+        dist.all_gather_object(node_ranks, config.node_rank, group=world.cpu_group)
+        if any(not 0 <= node < config.num_nodes for node in node_ranks):
+            raise ValueError(f"Invalid MemFabric Engram machine coordinates in vLLM world group: {node_ranks}")
+        local_workers = [rank for rank, node in enumerate(node_ranks) if node == config.node_rank]
+        local_rank = local_workers.index(world.rank_in_group)
+        self.local_size = len(local_workers)
         self.world_size = self.local_size * config.num_nodes
         self.rank = config.node_rank * self.local_size + local_rank
-        self.tp = tp
-        self.tp_rank = tp_rank
         self.num_nodes = config.num_nodes
         self.node_rank = config.node_rank
         self.local_rank = local_rank
