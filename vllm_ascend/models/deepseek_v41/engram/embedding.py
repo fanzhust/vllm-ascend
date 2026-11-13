@@ -324,7 +324,9 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
             segment = self._memfabric_table.segment
             start = segment.owned_start
             end = start + segment.rows
-        with safe_open(root / index[key], framework="pt", device="cpu") as file:
+        # Safetensors wraps the full storage before slicing. Keep that step on
+        # CPU even when the model constructor sets the default device to NPU.
+        with torch.device("cpu"), safe_open(root / index[key], framework="pt", device="cpu") as file:
             tensor = file.get_slice(key)
             source_dtype = tensor.get_dtype()
             if getattr(self, "_memfabric_table", None) is not None:

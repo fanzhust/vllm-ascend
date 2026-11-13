@@ -295,6 +295,7 @@ def test_checkpoint_load_writes_rows_owned_outside_the_workers_heads(tmp_path):
     view = SimpleNamespace(copy_entries=MagicMock(), segment=SimpleNamespace(owned_start=5, rows=3))
 
     def copy_entries(start, code_chunk, scale_chunk):
+        assert code_chunk.device.type == scale_chunk.device.type == "cpu"
         stop = start + code_chunk.shape[0]
         stored_codes[start:stop].copy_(code_chunk)
         stored_scales[start:stop].copy_(scale_chunk)
@@ -313,7 +314,9 @@ def test_checkpoint_load_writes_rows_owned_outside_the_workers_heads(tmp_path):
     table.weight_scale_inv = torch.nn.Parameter(torch.empty(0, dtype=torch.float32), requires_grad=False)
     table.bind_checkpoint(tmp_path, key)
 
-    table.load_checkpoint(tmp_path, key, chunk_rows=2)
+    # Model construction supplies a non-CPU default device to this loader.
+    with torch.device("meta"):
+        table.load_checkpoint(tmp_path, key, chunk_rows=2)
     torch.testing.assert_close(stored_codes, codes[5:8])
     torch.testing.assert_close(stored_scales, scales[5:8])
     view.copy_entries.reset_mock()
