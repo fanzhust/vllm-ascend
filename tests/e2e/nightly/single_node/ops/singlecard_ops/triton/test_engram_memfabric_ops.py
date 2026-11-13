@@ -190,6 +190,56 @@ def test_map_ids_only():
     assert count.cpu().item() == rows
 
 
+@torch.inference_mode()
+def test_map_ids_only_dp2_tp8():
+    """Check the owner boundary at production row counts on a single NPU."""
+    device = _device()
+    init_device_properties_triton()
+    # Layer 1, pool 2 in the 24-column, two-layer Engram checkpoint.
+    pool_base, pool_rows = 96_000_564, 48_000_505
+    owner_rows, extra_owners = divmod(pool_rows, 2)
+    split = owner_rows + extra_owners
+    rows_per_slot = 48_001_205
+    head_start, local_heads = 6, 3
+    ids_cpu = torch.full((2, 24), -1, dtype=torch.int32)
+    ids_cpu[:, head_start : head_start + local_heads] = torch.tensor(
+        [
+            [pool_base, pool_base + split - 1, pool_base + pool_rows - 1],
+            [-1, pool_base + split, pool_base + pool_rows],
+        ],
+        dtype=torch.int32,
+    )
+    ids = ids_cpu.to(device)
+    rows = ids.shape[0] * local_heads
+    global_ids = torch.full((rows,), -1, dtype=torch.int64, device=device)
+    count = torch.full((1,), -1, dtype=torch.int32, device=device)
+
+    _engram_memfabric_map_ids_kernel[(1,)](
+        ids,
+        global_ids,
+        count,
+        rows,
+        pool_base,
+        pool_base + pool_rows,
+        ids.stride(0),
+        HEAD_START=head_start,
+        LOCAL_HEADS=local_heads,
+        POOL_ROW_BASE=pool_base,
+        OWNER_ROWS=owner_rows,
+        EXTRA_OWNERS=extra_owners,
+        LAYER_BASE=0,
+        ROWS_PER_SLOT=rows_per_slot,
+        SAFE_ENTRY_ID=0,
+        BLOCK=MEMFABRIC_MAP_BLOCK,
+        num_warps=1,
+    )
+    _sync("map-ids-only-dp2-tp8")
+
+    expected = torch.tensor([0, split - 1, rows_per_slot + owner_rows - 1, 0, rows_per_slot, 0], dtype=torch.int64)
+    torch.testing.assert_close(global_ids.cpu(), expected, rtol=0, atol=0)
+    assert count.cpu().item() == rows
+
+
 @dataclass
 class _PoolFixture:
     pool: MemFabricEngramPool

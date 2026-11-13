@@ -153,17 +153,19 @@ def _engram_memfabric_map_ids_kernel(
         other=0,
     ).to(tl.int64)
     valid = mask & (source_row >= vocab_start) & (source_row < vocab_end)
-    pool_row = tl.where(valid, source_row - POOL_ROW_BASE, 0).to(tl.uint32)
+    # Keep row arithmetic signed and 64-bit. Ascend HFusion does not reliably
+    # lower unsigned division/remainder or preserve large int32 quotients.
+    pool_row = tl.where(valid, source_row - POOL_ROW_BASE, 0)
     long_owner_span: tl.constexpr = (OWNER_ROWS + 1) * EXTRA_OWNERS
     if EXTRA_OWNERS:
-        tail = tl.maximum(pool_row, long_owner_span) - long_owner_span
         is_long = pool_row < long_owner_span
+        tail = tl.where(is_long, 0, pool_row - long_owner_span)
         owner = tl.where(is_long, pool_row // (OWNER_ROWS + 1), EXTRA_OWNERS + tail // OWNER_ROWS)
         local_row = tl.where(is_long, pool_row % (OWNER_ROWS + 1), tail % OWNER_ROWS)
     else:
         owner = pool_row // OWNER_ROWS
         local_row = pool_row % OWNER_ROWS
-    entry_id = owner.to(tl.int64) * ROWS_PER_SLOT + LAYER_BASE + local_row
+    entry_id = owner * ROWS_PER_SLOT + LAYER_BASE + local_row
     # Use this worker's first backed row for invalid IDs. The dequant kernel
     # masks their outputs, and padding does not generate remote DRAM reads.
     tl.store(global_ids + row, tl.where(valid, entry_id, SAFE_ENTRY_ID), mask=mask)
