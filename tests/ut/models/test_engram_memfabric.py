@@ -4,6 +4,7 @@
 
 import json
 import socket
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ pytest.importorskip(
     reason="DeepSeek V4.1 is unavailable on this vLLM release",
 )
 
+from vllm_ascend import envs
 from vllm_ascend.model_executor.warmup import engram_memfabric_warmup as ordered_warmup
 from vllm_ascend.models.deepseek_v41 import model as model_mod
 from vllm_ascend.models.deepseek_v41.engram import embedding as embedding_mod
@@ -238,6 +240,7 @@ def test_memfabric_staging_fp32_view_preserves_packed_row_layout():
     pool = SimpleNamespace(
         membership=SimpleNamespace(members=(0,), rank_id=0),
         layout=layout,
+        use_fused_lookup=False,
         entries=torch.zeros((layout.rows_per_slot, ENTRY_BYTES), dtype=torch.uint8),
     )
     view = MemFabricEngramTableView(pool, layout.segments[0], max_lookup_rows=3, device=torch.device("cpu"))
@@ -249,6 +252,78 @@ def test_memfabric_staging_fp32_view_preserves_packed_row_layout():
     view.staging_fp32[:, CODE_BYTES // 4 :].copy_(scales)
 
     torch.testing.assert_close(view.staging[:, CODE_BYTES:].view(torch.float32), scales)
+
+
+@pytest.mark.parametrize(("value", "expected"), [(None, False), ("0", False), ("1", True)])
+def test_memfabric_fused_lookup_env(monkeypatch, value, expected):
+    name = "VLLM_ASCEND_ENGRAM_MF_FUSED"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    assert envs.VLLM_ASCEND_ENGRAM_MF_FUSED is expected
+
+
+def test_memfabric_fused_lookup_rejects_old_wheel_before_mapping(monkeypatch):
+    control = MagicMock(tp=1)
+    control.plan.return_value = (1, object())
+    control.exchange_errors.side_effect = RuntimeError("layout rejected")
+    pool = MagicMock()
+    monkeypatch.setenv("VLLM_ASCEND_ENGRAM_MF_FUSED", "1")
+    monkeypatch.setitem(sys.modules, "memfabric_hybrid", SimpleNamespace(offload=object()))
+    monkeypatch.setattr(memfabric_mod, "EngramPoolControl", lambda *_: control)
+    monkeypatch.setattr(memfabric_mod, "MemFabricEngramPool", pool)
+
+    with pytest.raises(RuntimeError, match="layout rejected"):
+        memfabric_mod.MemFabricEngramSession([(1, (10,))], 4, object(), object(), lambda: "checkpoint")
+
+    stage, error = control.exchange_errors.call_args.args
+    assert stage == "layout"
+    assert "requires a wheel with engram_entry_gather support" in error
+    pool.assert_not_called()
+
+
+def test_memfabric_fused_lookup_skips_legacy_scratch_and_reuses_descriptor():
+    layout = MemFabricEngramLayout.build([(1, (10, 11, 20, 23)), (14, (14, 17, 19, 24))], 2, 1, 2, 1)
+    offload = SimpleNamespace(EngramLookupDesc=MagicMock(), engram_entry_gather=MagicMock(return_value=0))
+    pool = SimpleNamespace(
+        membership=SimpleNamespace(members=(0, 1), rank_id=1),
+        layout=layout,
+        entries=torch.zeros((layout.rows_per_slot, ENTRY_BYTES), dtype=torch.uint8),
+        offload=offload,
+        use_fused_lookup=True,
+        ready=True,
+    )
+    view = MemFabricEngramTableView(pool, layout.segments[1], max_lookup_rows=3, device=torch.device("cpu"))
+    view.configure_fused_lookup(head_start=3, local_heads=1, vocab_start=50, vocab_end=74)
+    offload.EngramLookupDesc.assert_called_once_with(
+        head_start=3,
+        local_heads=1,
+        vocab_start=50,
+        vocab_end=74,
+        pool_row_base=31,
+        owner_rows=21,
+        extra_owners=1,
+        layer_base=22,
+    )
+    assert view.global_ids is view.count is view.staging is view.staging_fp32 is None
+
+    # Same non-contiguous per-layer view produced by the actual hash path.
+    ids = torch.empty((3, 2, 4), dtype=torch.int32)[:, 1]
+    output = torch.empty((3, CODE_BYTES), dtype=torch.bfloat16)
+    kwargs = dict(head_start=3, local_heads=1, pad_heads=1, output=output, vocab_start=50, vocab_end=74)
+    assert npu_mod.gather_dequantize_memfabric(view, ids, **kwargs) is output
+    forwarded_ids, desc, out = offload.engram_entry_gather.call_args.args
+    assert forwarded_ids is ids
+    assert desc is view.fused_lookup_desc
+    assert out.shape == (3, 1, CODE_BYTES)
+    assert out.data_ptr() == output.data_ptr()
+
+    offload.engram_entry_gather.return_value = -1
+    with pytest.raises(RuntimeError, match="Fused MemFabric Engram lookup failed: rc=-1"):
+        npu_mod.gather_dequantize_memfabric(view, ids, **kwargs)
+    view.close()
+    assert view.fused_lookup_desc is None
 
 
 def test_memfabric_allows_cross_node_tp_but_host_uva_does_not(monkeypatch):

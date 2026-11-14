@@ -271,7 +271,7 @@ and use the `main` branch with the matching vLLM revision recorded in
 
 MemFabric SHARED pools hold packed INT8/FP32 Engram rows (288 bytes each).
 Each worker owns one row range in its head pool. The lookup uses
-`entry_gather` to stage rows in local NPU memory before dequantization.
+`entry_gather` to stage rows in local NPU memory before dequantization by default.
 All pools together hold one logical copy of the table.
 
 Use a `memfabric_hybrid` wheel with A3 multi-node SHARED, `local_world_size`,
@@ -280,6 +280,14 @@ Use a `memfabric_hybrid` wheel with A3 multi-node SHARED, `local_world_size`,
 For the A3 trial, use the 1.5.0 wheel from the MemFabric build under test.
 When installing this source tree into that prepared environment, use
 `pip install -e . --no-deps` so dependency installation does not replace it.
+
+For a single-node A/B comparison on A3, keep the same MemFabric configuration
+and set `VLLM_ASCEND_ENGRAM_MF_FUSED=1` before launching vLLM to fuse ID mapping,
+DRAM gather, and dequantization into one kernel. Set it to `0` (default) or
+unset it to retain the legacy three-op path. Restart all workers when changing
+the setting. The fused path requires a MemFabric wheel and compiled
+`acc_offload` extension that include `engram_entry_gather`; it does not
+silently fall back. Check the pool startup log for `lookup=fused` or `lookup=legacy`.
 
 For single-node DP2/TP8, set `--engram-config '{"cpu_offload":true}'` and merge
 the following object into `--additional-config`:

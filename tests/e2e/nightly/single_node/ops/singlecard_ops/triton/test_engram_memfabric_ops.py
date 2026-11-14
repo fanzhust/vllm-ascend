@@ -365,3 +365,37 @@ def test_full_pipeline_back_to_back(mf_pool: _PoolFixture):
     _sync("full-pipeline-back-to-back")
     for layer, output in enumerate(outputs):
         torch.testing.assert_close(output.cpu(), _pipeline_expected(mf_pool, layer, ids_cpu), rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_fused_lookup_matches_legacy(mf_pool: _PoolFixture, monkeypatch):
+    if not callable(getattr(mf_pool.pool.offload, "engram_entry_gather", None)):
+        pytest.skip("requires a MemFabric wheel with fused Engram lookup")
+
+    ids_cpu, _ = _pipeline_inputs(mf_pool.device)
+    hashes = torch.stack((torch.full_like(ids_cpu, -1), ids_cpu), dim=1).to(mf_pool.device)
+    ids = hashes[:, 1]
+    layer = 1  # A nonzero layer base in a pool with a nonzero hash base.
+    legacy = _submit_full_pipeline(mf_pool, layer, ids)
+    _sync("legacy-reference")
+
+    monkeypatch.setattr(mf_pool.pool, "use_fused_lookup", True)
+    view = MemFabricEngramTableView(mf_pool.pool, mf_pool.views[layer].segment, MAX_LOOKUP_ROWS, mf_pool.device)
+    view.configure_fused_lookup(0, 2, VOCAB_START, VOCAB_START + TABLE_ROWS)
+    out = torch.empty_like(legacy)
+    try:
+        gather_dequantize_memfabric(
+            view,
+            ids,
+            head_start=0,
+            local_heads=2,
+            pad_heads=2,
+            output=out,
+            vocab_start=VOCAB_START,
+            vocab_end=VOCAB_START + TABLE_ROWS,
+        )
+        _sync("fused-pipeline")
+        torch.testing.assert_close(out, legacy, rtol=0, atol=0)
+        torch.testing.assert_close(out.cpu(), _pipeline_expected(mf_pool, layer, ids_cpu), rtol=0, atol=0)
+    finally:
+        view.close()

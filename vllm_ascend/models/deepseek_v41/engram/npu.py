@@ -259,18 +259,26 @@ def gather_dequantize_memfabric(
     vocab_start: int,
     vocab_end: int,
 ) -> torch.Tensor:
-    """Gather packed 288-byte INT8/FP32 rows and dequantize on the NPU."""
-    from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
-
+    """Look up packed INT8/FP32 rows with the selected MemFabric backend."""
     rows = ids.shape[0] * local_heads
     if rows == 0:
         return output
-    if rows > table.global_ids.numel():
+    if rows > table.max_lookup_rows:
         raise ValueError(
-            f"MemFabric Engram lookup needs {rows} rows, but its stable scratch holds {table.global_ids.numel()}"
+            f"MemFabric Engram lookup needs {rows} rows, but its capacity is {table.max_lookup_rows}"
         )
     if not table.pool.ready:
         raise RuntimeError("MemFabric Engram lookup started before the pool was ready")
+    if table.pool.use_fused_lookup:
+        if table.fused_lookup_desc is None or pad_heads != local_heads:
+            raise RuntimeError("Fused MemFabric Engram lookup requires a bound descriptor and unpadded heads")
+        out = output.view(ids.shape[0], local_heads, table.code_bytes)
+        if rc := table.pool.offload.engram_entry_gather(ids, table.fused_lookup_desc, out):
+            raise RuntimeError(f"Fused MemFabric Engram lookup failed: rc={rc}; check the A3 acc_offload extension")
+        return output
+
+    from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+
     init_device_properties_triton()
     from vllm_ascend.ops.triton.engram_lookup import (
         _engram_memfabric_dequant_kernel,

@@ -17,6 +17,8 @@ import torch.distributed as dist
 from vllm.distributed import get_tensor_model_parallel_rank, get_world_group
 from vllm.logger import logger
 
+from vllm_ascend import envs
+
 from .memfabric_layout import (
     CODE_BYTES,
     ENTRY_BYTES,
@@ -181,26 +183,43 @@ class MemFabricEngramTableView:
     ) -> None:
         self.pool = pool
         self.segment = segment
+        self.max_lookup_rows = max_lookup_rows
+        self.fused_lookup_desc = None
         self.rows_per_slot = pool.layout.rows_per_slot
         self.code_bytes = CODE_BYTES
         self.owner_rows, self.extra_owners = divmod(segment.pool_rows, len(pool.membership.members))
         self.safe_entry_id = pool.membership.rank_id * self.rows_per_slot + segment.layer_base
         self.local_entries = pool.entries[segment.layer_base : segment.layer_base + segment.rows]
-        self.global_ids = torch.empty(max_lookup_rows, dtype=torch.int64, device=device)
-        self.count = torch.empty(1, dtype=torch.int32, device=device)
-        staging_bytes = max_lookup_rows * ENTRY_BYTES
-        self._staging_storage = torch.empty(staging_bytes + ENTRY_BYTES - 1, dtype=torch.int8, device=device)
-        staging_offset = (-self._staging_storage.data_ptr()) % ENTRY_BYTES
-        self.staging = self._staging_storage[staging_offset : staging_offset + staging_bytes].view(
-            max_lookup_rows, ENTRY_BYTES
-        )
-        self.staging_fp32 = self.staging.view(torch.float32)
+        self.global_ids = self.count = self._staging_storage = self.staging = self.staging_fp32 = None
+        if not pool.use_fused_lookup:
+            self.global_ids = torch.empty(max_lookup_rows, dtype=torch.int64, device=device)
+            self.count = torch.empty(1, dtype=torch.int32, device=device)
+            staging_bytes = max_lookup_rows * ENTRY_BYTES
+            self._staging_storage = torch.empty(staging_bytes + ENTRY_BYTES - 1, dtype=torch.int8, device=device)
+            staging_offset = (-self._staging_storage.data_ptr()) % ENTRY_BYTES
+            self.staging = self._staging_storage[staging_offset : staging_offset + staging_bytes].view(
+                max_lookup_rows, ENTRY_BYTES
+            )
+            self.staging_fp32 = self.staging.view(torch.float32)
         self.lookup_output = (
             torch.empty(lookup_output_shape, dtype=torch.bfloat16, device=device)
             if lookup_output_shape is not None
             else None
         )
         self.closed = False
+
+    def configure_fused_lookup(self, head_start: int, local_heads: int, vocab_start: int, vocab_end: int) -> None:
+        if self.pool.use_fused_lookup:
+            self.fused_lookup_desc = self.pool.offload.EngramLookupDesc(
+                head_start=head_start,
+                local_heads=local_heads,
+                vocab_start=vocab_start,
+                vocab_end=vocab_end,
+                pool_row_base=self.segment.pool_row_base,
+                owner_rows=self.owner_rows,
+                extra_owners=self.extra_owners,
+                layer_base=self.segment.layer_base,
+            )
 
     def copy_entries(self, local_row_start: int, codes: torch.Tensor, scales: torch.Tensor) -> None:
         """Copy locally owned rows as packed [256B codes, 32B scales]."""
@@ -231,6 +250,7 @@ class MemFabricEngramTableView:
         if self.closed:
             return
         self.local_entries = None
+        self.fused_lookup_desc = None
         self.global_ids = None
         self.count = None
         self.staging_fp32 = None
@@ -245,7 +265,13 @@ class MemFabricEngramPool:
     """A process's sole acc_offload session."""
 
     def __init__(
-        self, device_id: int, membership: EngramPoolMembership, store_url: str, layout: MemFabricEngramLayout
+        self,
+        device_id: int,
+        membership: EngramPoolMembership,
+        store_url: str,
+        layout: MemFabricEngramLayout,
+        *,
+        use_fused_lookup: bool = False,
     ) -> None:
         self.layout = layout
         self.offload: Any = None
@@ -256,6 +282,7 @@ class MemFabricEngramPool:
         self._buffer = None
         self.device_id = device_id
         self.membership = membership
+        self.use_fused_lookup = use_fused_lookup
         slot_size = ((layout.rows_per_slot * ENTRY_BYTES + ONE_GIB - 1) // ONE_GIB) * ONE_GIB
         backed_bytes = layout.local_rows_span * ENTRY_BYTES
         acl = _load_acl_context_api()
@@ -300,7 +327,8 @@ class MemFabricEngramPool:
         finally:
             _restore_acl_context(acl, caller_context)
         logger.info(
-            "MemFabric Engram pool=%d rank=%d/%d local_world=%d device=%d store=%s rows_per_slot=%d slot_bytes=%d",
+            "MemFabric Engram pool=%d rank=%d/%d local_world=%d device=%d store=%s rows_per_slot=%d slot_bytes=%d "
+            "lookup=%s",
             membership.pool_index,
             membership.rank_id,
             len(membership.members),
@@ -309,6 +337,7 @@ class MemFabricEngramPool:
             store_url,
             layout.rows_per_slot,
             slot_size,
+            "fused" if use_fused_lookup else "legacy",
         )
 
     def close(self) -> None:
@@ -344,8 +373,20 @@ class MemFabricEngramSession:
             preflight_error = f"{type(exc).__name__}: {exc}"
         num_pools, membership = self.control.plan(identity, preflight_error)
         layout = None
+        use_fused_lookup = False
         error = None
         try:
+            use_fused_lookup = envs.VLLM_ASCEND_ENGRAM_MF_FUSED
+            if use_fused_lookup:
+                from memfabric_hybrid import offload
+
+                if not (
+                    callable(getattr(offload, "engram_entry_gather", None))
+                    and callable(getattr(offload, "EngramLookupDesc", None))
+                ):
+                    raise RuntimeError(
+                        "Fused MemFabric Engram lookup requires a wheel with engram_entry_gather support"
+                    )
             if any(len(heads) % self.control.tp for _, heads in layer_heads):
                 raise ValueError(f"Engram heads cannot be divided over TP{self.control.tp}")
             layout = MemFabricEngramLayout.build(
@@ -360,7 +401,11 @@ class MemFabricEngramSession:
         error = None
         try:
             self.pool = MemFabricEngramPool(
-                device_id, membership, self.control.store_url(membership.pool_index), layout
+                device_id,
+                membership,
+                self.control.store_url(membership.pool_index),
+                layout,
+                use_fused_lookup=use_fused_lookup,
             )
             for segment, (_, heads) in zip(layout.segments, layer_heads, strict=True):
                 local_heads = len(heads) // self.control.tp

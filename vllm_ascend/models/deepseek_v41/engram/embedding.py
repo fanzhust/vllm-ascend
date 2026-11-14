@@ -180,6 +180,9 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
                 and self.vocab_end_idx <= segment.pool_row_base + segment.pool_rows
             ):
                 raise ValueError("Engram TP head shard crosses its MemFabric pool boundary")
+            self._memfabric_table.configure_fused_lookup(
+                self.head_start, self.part_n_hash_cols, self.vocab_start_idx, self.vocab_end_idx
+            )
             # The checkpoint iterator still needs named parameters carrying
             # the custom weight_loader callback. Both codes and scales live in
             # the model-owned pool, so these are zero-sized NPU sentinels.
